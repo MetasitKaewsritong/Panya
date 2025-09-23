@@ -1,4 +1,4 @@
-# eval_logging.py
+
 import json, time, requests
 
 def ollama_generate_with_stats(prompt: str, model="llama3.2", base_url="http://localhost:11434", timeout_s=600):

@@ -1,9 +1,4 @@
-# backend/app/retriever.py
-# ------------------------------------------------------------
-# เสถียรขึ้น: ลงทะเบียน pgvector ทุกครั้งที่ยืม connection,
-# จัดการ metadata ที่เป็นสตริง, เพิ่ม domain/protocol boosting,
-# ตั้งค่า limit/top_n จาก env ได้, ล็อก error ให้อ่านง่าย
-# ------------------------------------------------------------
+
 import os
 import json
 import logging
