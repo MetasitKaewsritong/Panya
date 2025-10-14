@@ -1,10 +1,13 @@
+# backend/main.py
+
 import os
 import logging
 import requests
 import time
 import math
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
+import numpy as np
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,14 +19,10 @@ from langchain_ollama import OllamaLLM
 from sentence_transformers import SentenceTransformer
 from psycopg2 import pool
 
-from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever
+from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever, NoRerankRetriever
 from app.chatbot import answer_question
-from app.ragas_eval import local_ragas_eval
 
-
-from agent_pipeline import pipeline
 import mimetypes
-import importlib
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -43,6 +42,19 @@ logging.info(f"  EMBED_MODEL: {EMBED_MODEL_NAME}")
 # -------------------------
 # Helpers
 # -------------------------
+def _to_bool(val: Any) -> Optional[bool]:
+    """แปลงค่าที่ส่งมาทาง form ('true'/'false'/1/0) ให้เป็น bool; ถ้าแปลไม่ได้คืน None"""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return None
+
 def wait_for_ollama():
     logging.info("🔄 Checking Ollama service readiness...")
     for attempt in range(30):
@@ -57,28 +69,25 @@ def wait_for_ollama():
     logging.error("❌ Ollama service not ready after timeout.")
     return False
 
-def ensure_model(model_name: str):
+def ensure_model(model_name: str) -> bool:
     try:
         logging.info(f"🔄 Checking for LLM model: '{model_name}'")
-        tags_response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
-        tags_data = tags_response.json()
-        available = [m['name'].split(":")[0] for m in tags_data.get("models", [])]
-        logging.info(f"Available models: {available}")
-        if model_name not in available:
-            logging.warning(f"⚠️ Model '{model_name}' not found. Pulling now...")
-            pull_response = requests.post(
-                f"{OLLAMA_BASE_URL}/api/pull",
-                json={"name": model_name},
-                timeout=600
-            )
-            if pull_response.status_code == 200:
-                logging.info(f"✅ Model '{model_name}' pulled successfully.")
-            else:
-                logging.error(f"❌ Failed to pull model '{model_name}': {pull_response.text}")
-                return False
-        else:
+        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
+        r.raise_for_status()
+        models = r.json().get("models", [])
+        available_full = {m.get("name", "") for m in models}
+        available_base = {m.get("name", "").split(":")[0] for m in models}
+        base = model_name.split(":")[0]
+        if model_name in available_full or base in available_base:
             logging.info(f"✅ Model '{model_name}' is available.")
-        return True
+            return True
+        logging.warning(f"⚠️ Model '{model_name}' not found. Pulling now...")
+        pr = requests.post(f"{OLLAMA_BASE_URL}/api/pull", json={"name": model_name}, timeout=1800)
+        if pr.status_code == 200:
+            logging.info(f"✅ Model '{model_name}' pulled successfully.")
+            return True
+        logging.error(f"❌ Failed to pull model '{model_name}': {pr.text}")
+        return False
     except Exception as e:
         logging.error(f"🔥 Error ensuring model '{model_name}': {e}")
         return False
@@ -102,186 +111,25 @@ def test_database_connection():
         logging.error(f"🔥 Database connection test failed: {e}")
         return False
 
-# -------------------------
-# JSON sanitizer: NaN/Inf -> None
-# -------------------------
-def _is_bad_float(x: Any) -> bool:
-    return isinstance(x, float) and (math.isnan(x) or math.isinf(x))
-
 def sanitize_json(obj: Any):
-    if _is_bad_float(obj):
+    """Convert numpy types and handle NaN/Inf values for JSON serialization"""
+    if obj is None:
+        return None
+    if isinstance(obj, (np.float32, np.float64)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
     if isinstance(obj, dict):
         return {k: sanitize_json(v) for k, v in obj.items()}
-    if isinstance(obj, list):
+    if isinstance(obj, (list, tuple)):
         return [sanitize_json(v) for v in obj]
     return obj
-
-# ---- RAGAS helpers ----
-def _to_1_10(x):
-    # handle None/NaN/Inf robustly
-    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-        return None
-    try:
-        x = max(0.0, min(1.0, float(x))) * 10.0
-        return round(max(1.0, x), 2)
-    except Exception:
-        return None
-
-def _load_ragas_adapters():
-    trials = [
-        ("ragas.integrations.langchain", "LangchainLLM", "LangchainEmbeddings"),
-        ("ragas.integrations.langchain", "LangChainLLM", "LangChainEmbeddings"),
-        ("ragas.llms", "LangchainLLM", None),
-        ("ragas.llms", "LangChainLLM", None),
-    ]
-    for mod, llm_name, emb_name in trials:
-        try:
-            m = importlib.import_module(mod)
-            LLMClass = getattr(m, llm_name)
-            if emb_name:
-                EmbClass = getattr(m, emb_name)
-            else:
-                me = importlib.import_module("ragas.embeddings")
-                EmbClass = getattr(me, "LangchainEmbeddings", None) or getattr(me, "LangChainEmbeddings")
-            return LLMClass, EmbClass
-        except Exception:
-            continue
-    return None, None
-
-def compute_ragas_single(question, contexts, answer):
-    """
-    ใช้ RAGAS แบบยืดหยุ่น:
-    - โหลด adapter ได้หลาย path/ชื่อคลาส (รองรับต่างเวอร์ชัน)
-    - บังคับ LLM = Ollama (ไม่แตะ OpenAI)
-    - ถ้า LLM path ล้ม → fallback no‑LLM (context_precision/recall)
-    """
-    import math, importlib, os
-    try:
-        from datasets import Dataset
-        from ragas import evaluate
-        # นำ metric มาแบบฟังก์ชัน (ไม่ bind อะไรใน constructor)
-        from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
-        from langchain_ollama import OllamaLLM
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-    except Exception as e:
-        return {"error": "ragas_unavailable", "detail": f"imports_failed: {e}"}
-
-    ds = Dataset.from_list([{
-        "question": question or "",
-        "contexts": contexts or [],
-        "answer": answer or "",
-        "ground_truth": ""
-    }])
-
-    # ----- ตัวโหลด adapter แบบยืดหยุ่น (รองรับหลายเวอร์ชัน/หลายชื่อคลาส)
-    def _load_ragas_adapters():
-        trials = [
-            ("ragas.integrations.langchain", "LangchainLLM", "LangchainEmbeddings"),
-            ("ragas.integrations.langchain", "LangChainLLM", "LangChainEmbeddings"),
-            ("ragas.llms", "LangchainLLM", None),
-            ("ragas.llms", "LangChainLLM", None),
-        ]
-        for mod, llm_name, emb_name in trials:
-            try:
-                m = importlib.import_module(mod)
-                LLMClass = getattr(m, llm_name)
-                if emb_name:
-                    EmbClass = getattr(m, emb_name)
-                else:
-                    me = importlib.import_module("ragas.embeddings")
-                    EmbClass = getattr(me, "LangchainEmbeddings", None) or getattr(me, "LangChainEmbeddings")
-                return LLMClass, EmbClass
-            except Exception:
-                continue
-        return None, None
-
-    LLMAdapter, EmbAdapter = _load_ragas_adapters()
-    use_llm = LLMAdapter is not None and EmbAdapter is not None
-
-    try:
-        if use_llm:
-            judge = LLMAdapter(
-                OllamaLLM(
-                    model=os.getenv("RAGAS_JUDGE_MODEL", os.getenv("OLLAMA_MODEL", "llama3.2")),
-                    base_url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434"),
-                    temperature=0
-                )
-            )
-            emb = EmbAdapter(
-                HuggingFaceEmbeddings(
-                    model_name=os.getenv("EVAL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
-                    encode_kwargs={"normalize_embeddings": True}
-                )
-            )
-            res = evaluate(ds, metrics=[faithfulness, answer_relevancy, context_precision, context_recall],
-                           llm=judge, embeddings=emb)
-        else:
-            # no‑LLM: คิดเฉพาะ context_* (กันฉุกเฉิน ไม่ต้องใช้ LLM)
-            hf = HuggingFaceEmbeddings(
-                model_name=os.getenv("EVAL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
-                encode_kwargs={"normalize_embeddings": True}
-            )
-            class _EmbWrap:
-                def __init__(self, inner): self.inner = inner
-                def embed_documents(self, texts): return self.inner.embed_documents(texts)
-                def embed_query(self, text): return self.inner.embed_query(text)
-            res = evaluate(ds, metrics=[context_precision, context_recall], embeddings=_EmbWrap(hf))
-    except Exception as e:
-        # ถ้า LLM path ล้มกลางคัน → fallback no‑LLM
-        try:
-            from ragas.metrics import context_precision, context_recall
-            hf = HuggingFaceEmbeddings(
-                model_name=os.getenv("EVAL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
-                encode_kwargs={"normalize_embeddings": True}
-            )
-            class _EmbWrap:
-                def __init__(self, inner): self.inner = inner
-                def embed_documents(self, texts): return self.inner.embed_documents(texts)
-                def embed_query(self, text): return self.inner.embed_query(text)
-            res = evaluate(ds, metrics=[context_precision, context_recall], embeddings=_EmbWrap(hf))
-        except Exception as ee:
-            return {"error": "ragas_eval_failed", "detail": str(ee)}
-
-    # ---- ดึงผล + scale 1-10 อย่างทนทาน ----
-    try:
-        results_obj = getattr(res, "results", None)
-        if results_obj is not None:
-            try:
-                row = results_obj[0]
-            except Exception:
-                row = results_obj.to_pandas().iloc[0].to_dict()
-        else:
-            row = {
-                "answer_relevancy": res.get("answer_relevancy"),
-                "faithfulness": res.get("faithfulness"),
-                "context_precision": res.get("context_precision"),
-                "context_recall": res.get("context_recall"),
-            }
-    except Exception:
-        row = {"answer_relevancy": None, "faithfulness": None, "context_precision": None, "context_recall": None}
-
-    def _to_1_10(x):
-        if x is None: return None
-        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)): return None
-        x = max(0.0, min(1.0, float(x))) * 10.0
-        return round(max(1.0, x), 2)
-
-    raw = {
-        "answer_relevancy": row.get("answer_relevancy"),
-        "faithfulness": row.get("faithfulness"),
-        "context_precision": row.get("context_precision"),
-        "context_recall": row.get("context_recall"),
-    }
-    scaled = {
-        "relevance": _to_1_10(raw["answer_relevancy"]),
-        "faithfulness": _to_1_10(raw["faithfulness"]),
-        "context_precision": _to_1_10(raw["context_precision"]),
-        "context_recall": _to_1_10(raw["context_recall"]),
-    }
-    return {"raw": raw, "scale_1_10": scaled}
-
-
 
 # ---- FastAPI Lifespan ----
 @asynccontextmanager
@@ -310,6 +158,11 @@ async def lifespan(app: FastAPI):
     app.state.embedder = None
 
     if wait_for_ollama() and ensure_model(OLLAMA_MODEL):
+        judge_model = os.getenv("RAGAS_LLM_MODEL")
+        if judge_model and judge_model != OLLAMA_MODEL:
+            logging.info(f"🔄 Preloading RAGAS judge model: {judge_model}")
+            ensure_model(judge_model)
+
         try:
             app.state.llm = OllamaLLM(
                 model=OLLAMA_MODEL,
@@ -392,7 +245,6 @@ async def chat(fastapi_request: Request, chat_request: ChatRequest):
     llm = fastapi_request.app.state.llm
     embedder = fastapi_request.app.state.embedder
 
-    # 1) ตอบคำถาม
     result = answer_question(
         question=chat_request.message,
         db_pool=db_pool,
@@ -403,32 +255,126 @@ async def chat(fastapi_request: Request, chat_request: ChatRequest):
         reranker_class=EnhancedFlashrankRerankRetriever
     )
 
-    # 2) ประเมินด้วย RAGAS แบบโลคัล (ถ้าเปิดใช้)
-    ragas_payload = None
-    try:
-        if os.getenv("EVAL_WITH_RAGAS", "false").lower() in ("1", "true", "yes"):
-            # ดึง contexts อีกรอบ แบบ list[str]
-            base_ret = PostgresVectorRetriever(connection_pool=fastapi_request.app.state.db_pool, embedder=embedder, collection=chat_request.collection)
-            reranker = EnhancedFlashrankRerankRetriever(base_retriever=base_ret)
-            docs = reranker.get_relevant_documents(chat_request.message)
-            contexts = [d.page_content for d in docs]
-
-            ragas_payload = local_ragas_eval(
-                question=chat_request.message,
-                answer=result.get("reply", ""),
-                contexts=contexts
-            )
-    except Exception as e:
-        ragas_payload = {"status": "skipped", "reason": str(e)}
-
     return ChatResponse(
-    reply=result["reply"],
-    processing_time=result.get("processing_time"),
-    retrieval_time=result.get("retrieval_time"),
-    context_count=result.get("context_count"),
-    ragas=sanitize_json(ragas_payload) if ragas_payload else None
-)
+        reply=result["reply"],
+        processing_time=result.get("processing_time"),
+        retrieval_time=result.get("retrieval_time"),
+        context_count=result.get("context_count"),
+        ragas=None
+    )
 
+@app.post("/api/agent-chat")
+async def agent_chat(
+    message: str = Form(""),
+    file: UploadFile = File(None),
+    log_eval: bool = Form(False),
+    enable_ragas: bool = Form(False),
+    fast_ragas: bool | None = Form(None),
+    ground_truth: str = Form(""),
+    use_rerank: Any = Form(None),   # อาจมาเป็น "true"/"false"
+    use_rank: Any = Form(None),     # alias กันพิมพ์แบบเดิม
+):
+
+    """Main agent endpoint - supports A/B test for reranker via use_rerank"""
+    # ---- decide rerank on/off (parse string → bool และรองรับ alias) ----
+    parsed_rerank = _to_bool(use_rerank)
+    parsed_alias  = _to_bool(use_rank)
+
+    decided = parsed_rerank if parsed_rerank is not None else parsed_alias
+    if decided is None:
+        decided = os.getenv("USE_RERANK_DEFAULT", "true").strip().lower() in ("1","true","yes","y","on")
+
+    use_rerank = decided
+    reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank else NoRerankRetriever
+
+
+    # ---- handle upload (optional OCR/ASR prepared path) ----
+    state = {"user_input": message}
+    if file:
+        content = await file.read()
+        mime_type, _ = mimetypes.guess_type(file.filename)
+        if mime_type and mime_type.startswith("image"):
+            state["image_bytes"] = content
+        elif mime_type and mime_type.startswith("audio"):
+            state["audio_bytes"] = content
+        else:
+            return {"error": "File type not supported"}
+
+    # ---- run QA with chosen rerank mode ----
+    start_time = time.perf_counter()
+    result = answer_question(
+        question=message,
+        db_pool=app.state.db_pool,
+        llm=app.state.llm,
+        embedder=app.state.embedder,
+        collection="plcnext",
+        retriever_class=PostgresVectorRetriever,
+        reranker_class=reranker_cls,
+    )
+    total_time = time.perf_counter() - start_time
+
+    contexts = result.get("contexts_list") or result.get("contexts") or []
+    ctx_for_eval = list(contexts)
+    if ground_truth.strip():
+        ctx_for_eval = [f"Question: {message}\nAnswer: {ground_truth.strip()}"] + ctx_for_eval
+
+    eval_info = None
+    ragas_metrics = None
+
+    # ---- optional eval log ----
+    if log_eval:
+        prompt = (
+            "จงตอบคำถามต่อไปนี้โดยอ้างอิงเฉพาะข้อมูลจากบริบทที่ให้เท่านั้น\n\n"
+            "บริบท:\n" + "\n".join(f"- {c}" for c in contexts) +
+            f"\n\nคำถาม: {message}\nคำตอบ:"
+        )
+        eval_answer, timing = ollama_generate_with_stats(
+            prompt, model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL
+        )
+        append_eval_run(
+            os.getenv("EVAL_LOG_FILE", "eval_runs.jsonl"),
+            {
+                "question": message,
+                "contexts": contexts,
+                "answer": eval_answer,
+                "ground_truth": ground_truth or "",
+                "timing": timing,
+                "use_rerank": use_rerank,
+            }
+        )
+        eval_info = {"logged": True, "contexts_count": len(contexts), "use_rerank": use_rerank}
+
+    # ---- RAGAS ----
+    if enable_ragas:
+        try:
+            if fast_ragas is None:
+                use_fast = os.getenv("DEFAULT_FAST_RAGAS", "false").strip().lower() == "true"
+            else:
+                use_fast = bool(fast_ragas)
+
+            from app.ragas_eval import simple_ragas_eval, local_ragas_eval
+            eval_fn = simple_ragas_eval if use_fast else local_ragas_eval
+
+            answer_text = (result.get("llm_answer") or result.get("reply") or "")[:1000]
+            ragas_metrics = eval_fn(
+                question=message,
+                answer=answer_text,
+                contexts=ctx_for_eval
+            )
+        except Exception as e:
+            ragas_metrics = {"status": "error", "reason": str(e)}
+
+    response = {
+        "reply": result.get("llm_answer", "") or result.get("reply", ""),
+        "processing_time": result.get("processing_time", total_time),
+        "retrieval_time": result.get("retrieval_time", None),
+        "context_count": result.get("context_count", None),
+        "contexts": contexts,
+        "eval": eval_info,
+        "ragas": ragas_metrics,
+        "use_rerank": use_rerank,  # <<< ระบุโหมดที่ใช้
+    }
+    return sanitize_json(response)
 
 @app.get("/api/collections")
 async def get_collections(request: Request):
@@ -487,6 +433,7 @@ async def root():
         "endpoints": {
             "health": "/health",
             "chat": "/api/chat",
+            "agent_chat": "/api/agent-chat",
             "collections": "/api/collections",
             "stats": "/api/stats"
         }
@@ -534,83 +481,6 @@ async def chat_image(
         reranker_class=EnhancedFlashrankRerankRetriever,
     )
     return ChatResponse(**result)
-
-@app.post("/api/agent-chat")
-async def agent_chat(
-    message: str = Form(""),
-    file: UploadFile = File(None),
-    log_eval: bool = Form(False),
-    return_ragas_metrics: bool = Form(False)
-):
-    state = {"user_input": message}
-    if file:
-        content = await file.read()
-        mime_type, _ = mimetypes.guess_type(file.filename)
-        if mime_type and mime_type.startswith("image"):
-            state["image_bytes"] = content
-        elif mime_type and mime_type.startswith("audio"):
-            state["audio_bytes"] = content
-        else:
-            return {"error": "File type not supported"}
-
-    start_time = time.perf_counter()
-    result = pipeline.invoke(state)
-    total_time = time.perf_counter() - start_time
-
-    contexts = result.get("contexts_list") or []
-
-    # --------- สำคัญ: กำหนดค่าเริ่มต้นไว้ก่อน ----------
-    eval_info = None
-    ragas_metrics = {"status": "skipped"}   # กัน UnboundLocalError แน่ ๆ
-    # ----------------------------------------------------
-
-    if log_eval:
-        prompt = (
-            "จงตอบคำถามต่อไปนี้โดยอ้างอิงเฉพาะข้อมูลจากบริบทที่ให้เท่านั้น ห้ามเดา\n\n"
-            "บริบท:\n" + "\n".join(f"- {c}" for c in contexts) +
-            f"\n\nคำถาม: {message}\nคำตอบ:"
-        )
-        eval_answer, timing = ollama_generate_with_stats(
-            prompt, model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL
-        )
-        append_eval_run(
-            os.getenv("EVAL_LOG_FILE", "eval_runs.jsonl"),
-            {
-                "question": message,
-                "contexts": contexts,
-                "answer": eval_answer,
-                "ground_truth": "",
-                "timing": timing,
-            }
-        )
-        eval_info = {
-            "logged": True,
-            "timing": timing,
-            "contexts_count": len(contexts),
-            "eval_answer_preview": (eval_answer[:200] + "...") if eval_answer else ""
-        }
-
-    if return_ragas_metrics:
-        try:
-            ragas_metrics = compute_ragas_single(
-                question=message,
-                contexts=contexts,
-                answer=result.get("llm_answer", "")
-            )
-        except Exception as e:
-            ragas_metrics = {"status": "skipped", "reason": str(e)}
-
-    response = {
-        "reply": result.get("llm_answer", ""),
-        "processing_time": result.get("processing_time", total_time),
-        "retrieval_time": result.get("retrieval_time", None),
-        "context_count": result.get("context_count", None),
-        "contexts": contexts,
-        "eval": eval_info,
-        "ragas": ragas_metrics
-    }
-    return sanitize_json(response)
-
 
 if __name__ == "__main__":
     import uvicorn
