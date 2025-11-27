@@ -31,12 +31,14 @@ services:
     ports:
       - "11434:11434"
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 3G
-        reservations:
-          memory: 2G
+    # --- แนะนำให้ปิดส่วนนี้ถ้าเครื่อง RAM < 16GB หรือเจอปัญหา Container ดับ ---
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 3G
+    #     reservations:
+    #       memory: 2G
+    # ------------------------------------------------------------------
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -54,17 +56,21 @@ services:
       ANYIO_BACKEND: asyncio
     volumes:
       - ./backend:/app
-      - "D:/65160250/NSC/plc_data/data/raw:/app/data/raw"
-      - "D:/65160250/NSC/plc_data/data/Knowledge:/app/data/Knowledge"
+      # ✅ Path นี้ถูกต้องแล้วสำหรับ WSL2
+      - "/mnt/d/65160250/NSC/plc_data/data/raw:/app/data/raw"
+      - "/mnt/d/65160250/NSC/plc_data/data/Knowledge:/app/data/Knowledge"
+    # ✅ ย้าย ports มาตรงนี้ให้ถูกต้อง
     ports:
       - "5000:5000"
     restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 6G
-        reservations:
-          memory: 3G
+    # --- แนะนำให้ปิดส่วนนี้เพื่อแก้ปัญหา Backend ติดๆ ดับๆ ---
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 6G
+    #     reservations:
+    #       memory: 3G
+    # -----------------------------------------------------
     depends_on:
       postgres:
         condition: service_healthy
