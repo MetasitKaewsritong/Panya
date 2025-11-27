@@ -1,9 +1,8 @@
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
 def preprocess_query(query: str) -> str:
-    """...ตาม main.py เดิม..."""
     abbreviations = {
         "plc": "PLCnext", 
         "hmi": "Human Machine Interface", 
@@ -56,17 +55,10 @@ def answer_question(
     collection: str,
     retriever_class,
     reranker_class,
-    top_k: int = 4,            # จำนวนบริบทสูงสุดที่จะใช้ในคำตอบ/คืนให้ฝั่งประเมิน
+    top_k: int = 4,
 ) -> dict:
-    """
-    Pipeline: preprocess -> retrieve+rerank -> compose prompt -> infer -> log -> return
-    ✅ จุดเพิ่มเติม:
-       - คืน contexts (list[str]) ที่ 'ใช้จริง' ในการสร้างคำตอบ (สำคัญต่อ RAGAs)
-       - วัด retrieval_time เฉพาะช่วงดึงบริบท (ไม่รวมเวลาที่ LLM ตอบ)
-    """
     import time
 
-    # 1) Validate & preprocess
     processed_msg = preprocess_query((question or "").strip())
     if not processed_msg:
         return {
@@ -79,7 +71,6 @@ def answer_question(
 
     t0 = time.perf_counter()
 
-    # 2) Build retriever -> reranker
     base_retriever = retriever_class(
         connection_pool=db_pool,
         embedder=embedder,
@@ -87,20 +78,17 @@ def answer_question(
     )
     reranker_retriever = reranker_class(base_retriever=base_retriever)
 
-    # 3) Retrieve (วัดเวลาเฉพาะส่วนนี้)
     t_retr_start = time.perf_counter()
-    retrieved_docs = reranker_retriever.get_relevant_documents(processed_msg) or []
+    # ✅ แก้จาก get_relevant_documents เป็น invoke
+    retrieved_docs = reranker_retriever.invoke(processed_msg) or []
     retrieval_time = time.perf_counter() - t_retr_start
 
-    # เตรียม contexts ที่จะใช้ 'จริง'
     context_texts = [d.page_content for d in retrieved_docs][:top_k]
     context_count = len(context_texts)
 
-    # 4) Compose prompt ด้วยบริบทข้างบน (ให้ RAGAs เทียบได้ตรงกับที่ใช้จริง)
     prompt = build_enhanced_prompt()
     context_str = "\n".join(f"- {c}" for c in context_texts)
 
-    # ใช้ LCEL แบบเรียบง่าย: ป้อน context_str ที่เตรียมไว้เข้า chain
     rag_chain = (
         {"context": (lambda _: context_str), "question": RunnablePassthrough()}
         | prompt
@@ -108,14 +96,11 @@ def answer_question(
         | StrOutputParser()
     )
 
-    # 5) Generate answer
     response_text = rag_chain.invoke(processed_msg)
     total_time = time.perf_counter() - t0
 
-    # 6) Log
     log_query_performance(processed_msg, response_text, retrieval_time, total_time, context_count)
 
-    # 7) Return (เพิ่ม contexts)
     return {
         "reply": response_text,
         "processing_time": total_time,

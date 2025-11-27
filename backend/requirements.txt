@@ -8,7 +8,9 @@ psycopg2-binary==2.9.9
 pgvector==0.2.5
 
 # ---- LangChain stack
-langchain-community
+langchain>=0.2.0        # <--- เพิ่มบรรทัดนี้ครับ (ตัวหลัก)
+langchain-community>=0.2.0
+langchain-core>=0.2.0   # <--- แนะนำให้ใส่ตัวนี้ด้วยเพื่อความชัวร์
 langchain-ollama>=0.1.0
 langgraph
 flashrank

@@ -16,7 +16,8 @@ services:
       test: ["CMD-SHELL", "pg_isready -U user -d plcnextdb || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
+      start_period: 30s
 
   ollama:
     image: ollama/ollama:latest
@@ -31,55 +32,47 @@ services:
     ports:
       - "11434:11434"
     restart: unless-stopped
-    # --- ปิด deploy/resources ชั่วคราว กันเครื่องค้าง ---
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 3G
-    #     reservations:
-    #       memory: 2G
     healthcheck:
       test: ["CMD", "ollama", "list"]
-      interval: 10s
+      interval: 20s
       timeout: 10s
-      retries: 30
+      retries: 5
+      start_period: 60s
 
   backend:
     build: ./backend
     container_name: plcnext-chatbot-backend-1
-    # ✅ ย้าย ports มาตรงนี้ (สำคัญมาก! ถ้าไม่แก้ตรงนี้ Frontend จะเข้าไม่ได้)
     ports:
       - "5000:5000"
     volumes:
       - ./backend:/app
-      # Path สำหรับ WSL2 (Drive D)
       - "/mnt/d/65160250/NSC/plc_data/data/raw:/app/data/raw"
       - "/mnt/d/65160250/NSC/plc_data/data/Knowledge:/app/data/Knowledge"
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000", "--loop", "asyncio"]
+    # Command นี้สำคัญ: workers 1 พอแล้วสำหรับแอปนี้
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "5000", "--workers", "1"]
     env_file:
       - ./.env
     environment:
       UVICORN_LOOP: asyncio
       ANYIO_BACKEND: asyncio
     restart: unless-stopped
-    # --- ปิด deploy/resources ชั่วคราว กัน Backend ดับ ---
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 6G
-    #     reservations:
-    #       memory: 3G
     depends_on:
       postgres:
         condition: service_healthy
       ollama:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
 
   frontend:
     build: ./frontend
     container_name: plcnext-chatbot-frontend-1
     environment:
-      # ใช้ localhost ได้ถ้าเปิดบน browser ในคอมเครื่องเดิม
+      # ถ้าใช้ Mobile App ให้เปลี่ยน localhost เป็น IP เครื่อง (เช่น http://192.168.1.50:5000)
       VITE_API_URL: http://localhost:5000
     ports:
       - "5173:5173"
