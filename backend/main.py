@@ -240,7 +240,7 @@ async def health_check(request: Request):
     return HealthResponse(status=status, services=services, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
 
 @app.post("/api/chat", response_model=ChatResponse)
-async def chat(fastapi_request: Request, chat_request: ChatRequest):
+def chat(fastapi_request: Request, chat_request: ChatRequest):
     db_pool = fastapi_request.app.state.db_pool
     llm = fastapi_request.app.state.llm
     embedder = fastapi_request.app.state.embedder
@@ -264,7 +264,7 @@ async def chat(fastapi_request: Request, chat_request: ChatRequest):
     )
 
 @app.post("/api/agent-chat")
-async def agent_chat(
+def agent_chat(
     message: str = Form(""),
     file: UploadFile = File(None),
     log_eval: bool = Form(False),
@@ -455,7 +455,7 @@ async def transcribe(file: UploadFile = File(...)):
     return {"text": transcript}
 
 @app.post("/api/chat-image", response_model=ChatResponse)
-async def chat_image(
+def chat_image(
     request: Request,
     file: UploadFile = File(...),
     message: str = Form("")
