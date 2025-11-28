@@ -1,6 +1,7 @@
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+from typing import Generator
 
 def preprocess_query(query: str) -> str:
     abbreviations = {
@@ -47,6 +48,9 @@ def log_query_performance(query: str, response: str, retrieval_time: float, tota
         f"Total Time: {total_time:.2f}s"
     )
 
+# ============================================================
+# ฟังก์ชันเดิม (ไม่มี streaming) - ใช้สำหรับ /api/chat
+# ============================================================
 def answer_question(
     question: str,
     db_pool,
@@ -79,7 +83,6 @@ def answer_question(
     reranker_retriever = reranker_class(base_retriever=base_retriever)
 
     t_retr_start = time.perf_counter()
-    # ✅ แก้จาก get_relevant_documents เป็น invoke
     retrieved_docs = reranker_retriever.invoke(processed_msg) or []
     retrieval_time = time.perf_counter() - t_retr_start
 
@@ -108,3 +111,73 @@ def answer_question(
         "context_count": context_count,
         "contexts": context_texts
     }
+
+
+# ============================================================
+# ⚡ ฟังก์ชันใหม่ (Streaming) - ใช้สำหรับ /api/chat/stream
+# ============================================================
+def answer_question_stream(
+    question: str,
+    db_pool,
+    llm,
+    embedder,
+    collection: str,
+    retriever_class,
+    reranker_class,
+    top_k: int = 4,
+) -> Generator[str, None, None]:
+    """
+    Streaming version ของ answer_question
+    ส่ง token ทีละตัวกลับไปทันทีที่ LLM generate ได้
+    """
+    import time
+    import json
+
+    processed_msg = preprocess_query((question or "").strip())
+    if not processed_msg:
+        yield f"data: {json.dumps({'token': 'Message cannot be empty.', 'done': True})}\n\n"
+        return
+
+    t0 = time.perf_counter()
+
+    # Step 1: Retrieval (ส่วนนี้ยังต้องรอ แต่ใช้เวลาแค่ 1-2 วินาที)
+    base_retriever = retriever_class(
+        connection_pool=db_pool,
+        embedder=embedder,
+        collection=collection,
+    )
+    reranker_retriever = reranker_class(base_retriever=base_retriever)
+
+    t_retr_start = time.perf_counter()
+    retrieved_docs = reranker_retriever.invoke(processed_msg) or []
+    retrieval_time = time.perf_counter() - t_retr_start
+
+    context_texts = [d.page_content for d in retrieved_docs][:top_k]
+    context_count = len(context_texts)
+    context_str = "\n".join(f"- {c}" for c in context_texts)
+
+    # ส่ง metadata ก่อน (retrieval เสร็จแล้ว)
+    yield f"data: {json.dumps({'type': 'metadata', 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count})}\n\n"
+
+    # Step 2: Build prompt
+    prompt = build_enhanced_prompt()
+    formatted_prompt = prompt.format(context=context_str, question=processed_msg)
+
+    # Step 3: Stream from LLM
+    full_response = ""
+    try:
+        # ใช้ .stream() method ของ LangChain LLM
+        for chunk in llm.stream(formatted_prompt):
+            if chunk:
+                full_response += chunk
+                yield f"data: {json.dumps({'type': 'token', 'token': chunk})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        return
+
+    total_time = time.perf_counter() - t0
+
+    # ส่ง final message
+    yield f"data: {json.dumps({'type': 'done', 'processing_time': round(total_time, 2), 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count})}\n\n"
+
+    log_query_performance(processed_msg, full_response, retrieval_time, total_time, context_count)
