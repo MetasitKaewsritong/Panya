@@ -14,7 +14,7 @@ import warnings
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse  # ⚡ เพิ่มสำหรับ streaming
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app.eval_logging import ollama_generate_with_stats, append_eval_run
@@ -23,7 +23,7 @@ from sentence_transformers import SentenceTransformer
 from psycopg2 import pool
 
 from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever, NoRerankRetriever
-from app.chatbot import answer_question, answer_question_stream  # ⚡ เพิ่ม streaming function
+from app.chatbot import answer_question, answer_question_stream
 
 import pytesseract
 from PIL import Image
@@ -133,6 +133,81 @@ def sanitize_json(obj: Any):
         return [sanitize_json(v) for v in obj]
     return obj
 
+
+# ⚡ ฟังก์ชันใหม่: อ่านเนื้อหาจากไฟล์ต่างๆ
+def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -> str:
+    """
+    อ่านเนื้อหาจากไฟล์หลายประเภท
+    รองรับ: PDF, TXT, CSV, JSON, DOCX, Image (OCR)
+    """
+    import json
+    
+    try:
+        # 1. Text files (.txt)
+        if mime_type == "text/plain" or filename.endswith(".txt"):
+            return file_content.decode("utf-8", errors="ignore")
+        
+        # 2. CSV files
+        if mime_type == "text/csv" or filename.endswith(".csv"):
+            return file_content.decode("utf-8", errors="ignore")
+        
+        # 3. JSON files
+        if mime_type == "application/json" or filename.endswith(".json"):
+            try:
+                data = json.loads(file_content.decode("utf-8"))
+                return json.dumps(data, indent=2, ensure_ascii=False)
+            except:
+                return file_content.decode("utf-8", errors="ignore")
+        
+        # 4. PDF files
+        if mime_type == "application/pdf" or filename.endswith(".pdf"):
+            try:
+                import fitz  # PyMuPDF
+                pdf_document = fitz.open(stream=file_content, filetype="pdf")
+                text = ""
+                for page in pdf_document:
+                    text += page.get_text()
+                pdf_document.close()
+                return text.strip()
+            except ImportError:
+                logging.warning("PyMuPDF not installed. Trying pdfplumber...")
+                try:
+                    import pdfplumber
+                    with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+                        text = ""
+                        for page in pdf.pages:
+                            text += (page.extract_text() or "") + "\n"
+                    return text.strip()
+                except ImportError:
+                    return "[Error: PDF reader not installed. Please install PyMuPDF or pdfplumber]"
+        
+        # 5. Word documents (.docx)
+        if filename.endswith(".docx"):
+            try:
+                from docx import Document
+                doc = Document(io.BytesIO(file_content))
+                text = "\n".join([para.text for para in doc.paragraphs])
+                return text.strip()
+            except ImportError:
+                return "[Error: python-docx not installed]"
+        
+        # 6. Image files (OCR)
+        if mime_type and mime_type.startswith("image"):
+            try:
+                image = Image.open(io.BytesIO(file_content))
+                text = pytesseract.image_to_string(image)
+                return text.strip()
+            except Exception as e:
+                return f"[Error reading image: {str(e)}]"
+        
+        # 7. Unknown file type
+        return f"[Unsupported file type: {mime_type or filename}]"
+        
+    except Exception as e:
+        logging.error(f"🔥 Error extracting text from file: {e}")
+        return f"[Error reading file: {str(e)}]"
+
+
 # ---- FastAPI Lifespan ----
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -165,7 +240,7 @@ async def lifespan(app: FastAPI):
                 model=OLLAMA_MODEL,
                 base_url=OLLAMA_BASE_URL,
                 temperature=0.0,
-                timeout=120  # ⚡ เพิ่ม timeout สำหรับ streaming
+                timeout=120
             )
             logging.info(f"✅ LLM ({OLLAMA_MODEL}) loaded.")
         except Exception as e:
@@ -236,9 +311,6 @@ def health_check(request: Request):
     status = "healthy" if all(services.values()) else "degraded"
     return HealthResponse(status=status, services=services, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
 
-# ============================================================
-# Endpoint เดิม (ไม่มี streaming)
-# ============================================================
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(fastapi_request: Request, chat_request: ChatRequest):
     db_pool = fastapi_request.app.state.db_pool
@@ -263,15 +335,9 @@ def chat(fastapi_request: Request, chat_request: ChatRequest):
         ragas=None
     )
 
-# ============================================================
-# ⚡ Endpoint ใหม่ (Streaming) - User เห็นคำตอบภายใน 2-3 วินาที
-# ============================================================
+# ⚡ Streaming endpoint
 @app.post("/api/chat/stream")
 def chat_stream(fastapi_request: Request, chat_request: ChatRequest):
-    """
-    Streaming chat endpoint - ส่งคำตอบทีละ token
-    Frontend ใช้ EventSource หรือ fetch + ReadableStream เพื่อรับข้อมูล
-    """
     db_pool = fastapi_request.app.state.db_pool
     llm = fastapi_request.app.state.llm
     embedder = fastapi_request.app.state.embedder
@@ -296,20 +362,12 @@ def chat_stream(fastapi_request: Request, chat_request: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # สำหรับ nginx
+            "X-Accel-Buffering": "no"
         }
     )
 
-
-# ============================================================
-# ⚡ Endpoint GET สำหรับทดสอบ streaming ง่ายๆ
-# ============================================================
 @app.get("/api/chat/stream")
 def chat_stream_get(message: str, collection: str = "plcnext", request: Request = None):
-    """
-    GET version สำหรับทดสอบ streaming ผ่าน browser
-    ใช้: /api/chat/stream?message=What is PLCnext?
-    """
     db_pool = request.app.state.db_pool
     llm = request.app.state.llm
     embedder = request.app.state.embedder
@@ -339,6 +397,7 @@ def chat_stream_get(message: str, collection: str = "plcnext", request: Request 
     )
 
 
+# ⚡ แก้ไข agent-chat ให้รองรับไฟล์หลายประเภท
 @app.post("/api/agent-chat")
 def agent_chat(
     message: str = Form(""),
@@ -358,20 +417,29 @@ def agent_chat(
     use_rerank = decided
     reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank else NoRerankRetriever
 
-    state = {"user_input": message}
+    # ⚡ ปรับปรุงการจัดการไฟล์
+    file_text = ""
     if file:
-        content = file.file.read() 
+        content = file.file.read()
         mime_type, _ = mimetypes.guess_type(file.filename)
-        if mime_type and mime_type.startswith("image"):
-            state["image_bytes"] = content
-        elif mime_type and mime_type.startswith("audio"):
-            state["audio_bytes"] = content
+        
+        # ⚡ รองรับไฟล์หลายประเภท
+        if mime_type and mime_type.startswith("audio"):
+            # Audio files - ใช้ transcribe endpoint แทน
+            return {"error": "Please use /api/transcribe for audio files"}
         else:
-            return {"error": "File type not supported"}
+            # ทุกประเภทอื่นๆ - extract text
+            file_text = extract_text_from_file(content, file.filename, mime_type)
+            logging.info(f"📄 Extracted {len(file_text)} characters from {file.filename}")
+    
+    # รวม message กับ file content
+    combined_message = message
+    if file_text:
+        combined_message = f"{message}\n\n--- File Content ({file.filename if file else 'unknown'}) ---\n{file_text}"
 
     start_time = time.perf_counter()
     result = answer_question(
-        question=message,
+        question=combined_message,
         db_pool=app.state.db_pool,
         llm=app.state.llm,
         embedder=app.state.embedder,
@@ -392,6 +460,7 @@ def agent_chat(
         "eval": None,
         "ragas": None,
         "use_rerank": use_rerank,
+        "file_processed": file.filename if file else None,
     }
     return sanitize_json(response)
 
@@ -452,11 +521,12 @@ def root():
         "endpoints": {
             "health": "/health",
             "chat": "/api/chat",
-            "chat_stream": "/api/chat/stream",  # ⚡ เพิ่ม streaming endpoint
+            "chat_stream": "/api/chat/stream",
             "agent_chat": "/api/agent-chat",
             "collections": "/api/collections",
             "stats": "/api/stats"
-        }
+        },
+        "supported_files": ["image/*", "audio/*", "pdf", "txt", "csv", "json", "docx"]
     }
 
 @app.post("/api/transcribe")
@@ -480,10 +550,6 @@ def chat_image(
     file: UploadFile = File(...),
     message: str = Form("")
 ):
-    import io
-    import pytesseract
-    from PIL import Image
-
     image_bytes = file.file.read()
     image = Image.open(io.BytesIO(image_bytes))
     ocr_text = pytesseract.image_to_string(image)

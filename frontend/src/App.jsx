@@ -15,6 +15,9 @@ import {
   Mic,
   XCircle,
   LoaderCircle,
+  FileText,
+  FileAudio,
+  Image as ImageIcon,
 } from "lucide-react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -34,6 +37,38 @@ const timeAgo = (date) => {
   interval = seconds / 60;
   if (interval > 1) return Math.floor(interval) + " minutes ago";
   return "Just now";
+};
+
+// ⚡ Helper: ตรวจสอบประเภทไฟล์
+const getFileType = (file) => {
+  if (!file) return null;
+  const mimeType = file.type;
+  if (mimeType.startsWith("image/")) return "image";
+  if (mimeType.startsWith("audio/")) return "audio";
+  if (mimeType === "application/pdf") return "pdf";
+  if (mimeType === "text/plain" || file.name.endsWith(".txt")) return "text";
+  if (mimeType === "text/csv" || file.name.endsWith(".csv")) return "csv";
+  if (mimeType === "application/json" || file.name.endsWith(".json")) return "json";
+  if (file.name.endsWith(".docx") || file.name.endsWith(".doc")) return "document";
+  return "unknown";
+};
+
+// ⚡ Helper: แสดง icon ตามประเภทไฟล์
+const FilePreviewIcon = ({ fileType, className }) => {
+  switch (fileType) {
+    case "image":
+      return <ImageIcon className={className} />;
+    case "audio":
+      return <FileAudio className={className} />;
+    case "pdf":
+    case "text":
+    case "csv":
+    case "json":
+    case "document":
+      return <FileText className={className} />;
+    default:
+      return <FileText className={className} />;
+  }
 };
 
 const CodeBlock = ({ language, value }) => {
@@ -97,7 +132,7 @@ const MessageContent = ({ text }) => {
   );
 };
 
-const Message = ({ text, sender, image }) => {
+const Message = ({ text, sender, image, fileName, fileType }) => {
   const isUser = sender === "user";
   return (
     <div className={`flex items-start gap-3 ${isUser ? "justify-end" : ""} my-4`}>
@@ -107,8 +142,15 @@ const Message = ({ text, sender, image }) => {
         </div>
       )}
       <div className={`max-w-2xl px-5 py-3 rounded-xl shadow-sm break-words ${isUser ? "bg-blue-600 text-white" : "bg-white text-gray-800 border"}`}>
-        {image && (
+        {/* ⚡ แสดง preview ตามประเภทไฟล์ */}
+        {image && fileType === "image" && (
           <img src={image} alt="upload" className="mb-2 max-h-40 rounded border" />
+        )}
+        {fileName && fileType !== "image" && (
+          <div className="mb-2 flex items-center gap-2 p-2 bg-gray-100 rounded border">
+            <FilePreviewIcon fileType={fileType} className="w-6 h-6 text-blue-500" />
+            <span className="text-sm text-gray-700 truncate">{fileName}</span>
+          </div>
         )}
         <MessageContent text={text} />
       </div>
@@ -232,8 +274,9 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null); 
-  const [imageFile, setImageFile] = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);  // ⚡ เปลี่ยนชื่อจาก imageFile
   const [previewUrl, setPreviewUrl] = useState(null);
+  const [fileType, setFileType] = useState(null);  // ⚡ เพิ่ม state สำหรับเก็บประเภทไฟล์
 
   // voice modal state
   const [isVoiceModalOpen, setIsVoiceModalOpen] = useState(false);
@@ -242,6 +285,17 @@ function App() {
   const fileInputRef = useRef(null);
 
   const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
+
+  // ⚡ รายการประเภทไฟล์ที่รองรับ
+  const ACCEPTED_FILE_TYPES = [
+    "image/*",           // รูปภาพทุกประเภท
+    "audio/*",           // เสียงทุกประเภท
+    ".pdf",              // PDF
+    ".txt",              // Text
+    ".csv",              // CSV
+    ".json",             // JSON
+    ".doc,.docx",        // Word documents
+  ].join(",");
 
   useEffect(() => {
     try {
@@ -336,29 +390,43 @@ function App() {
     setConfirmDeleteId(null);
   };
 
-  // 5. File preview
+  // 5. File preview - ⚡ แก้ไขให้รองรับหลายประเภท
   const handleFileSelect = (event) => {
     const file = event.target.files[0];
     if (!file) return;
-    setImageFile(file);
-    setPreviewUrl(URL.createObjectURL(file));
+    
+    const detectedType = getFileType(file);
+    setSelectedFile(file);
+    setFileType(detectedType);
+    
+    // สร้าง preview URL เฉพาะไฟล์รูปภาพ
+    if (detectedType === "image") {
+      setPreviewUrl(URL.createObjectURL(file));
+    } else {
+      setPreviewUrl(null);
+    }
+    
     event.target.value = null;
   };
+
   const cancelFileSelection = () => {
-    setImageFile(null);
+    setSelectedFile(null);
     setPreviewUrl(null);
+    setFileType(null);
   };
 
-  // 6. Send Message
+  // 6. Send Message - ⚡ แก้ไขให้รองรับหลายประเภท
   const handleSendMessage = async (e) => {
     e.preventDefault();
     const userText = input.trim();
-    if ((!userText && !imageFile) || isLoading || !activeChatId) return;
+    if ((!userText && !selectedFile) || isLoading || !activeChatId) return;
 
     const userMessage = {
       text: userText,
       sender: "user",
-      image: previewUrl,
+      image: fileType === "image" ? previewUrl : null,
+      fileName: selectedFile?.name || null,
+      fileType: fileType,
     };
     setInput("");
     setIsLoading(true);
@@ -376,7 +444,7 @@ function App() {
         );
         if (userMessages.length === 1) {
           newHistory[activeChatIndex].title =
-            userText.length > 30 ? `${userText.substring(0, 27)}...` : userText;
+            userText.length > 30 ? `${userText.substring(0, 27)}...` : (userText || selectedFile?.name || "File upload");
         }
       }
       return newHistory;
@@ -385,8 +453,8 @@ function App() {
     try {
       const formData = new FormData();
       formData.append("message", userText);
-      if (imageFile) {
-        formData.append("file", imageFile);
+      if (selectedFile) {
+        formData.append("file", selectedFile);
       }
       const response = await axios.post(
         `${API_URL}/api/agent-chat`,
@@ -432,8 +500,9 @@ function App() {
       });
     } finally {
       setIsLoading(false);
-      setImageFile(null);
+      setSelectedFile(null);
       setPreviewUrl(null);
+      setFileType(null);
     }
   };
 
@@ -558,7 +627,14 @@ function App() {
           <main className="flex-1 p-6 overflow-y-auto">
             <div className="max-w-4xl mx-auto">
               {messagesToDisplay.map((msg, index) => (
-                <Message key={index} text={msg.text} sender={msg.sender} image={msg.image}/>
+                <Message 
+                  key={index} 
+                  text={msg.text} 
+                  sender={msg.sender} 
+                  image={msg.image}
+                  fileName={msg.fileName}
+                  fileType={msg.fileType}
+                />
               ))}
               {isLoading && (
                 <div className="flex items-start gap-3 my-4">
@@ -580,18 +656,37 @@ function App() {
           {/* Footer/INPUT bar */}
           <footer className="p-4 bg-gray-100/80 backdrop-blur-sm">
             <div className="max-w-4xl mx-auto">
-              <div className={`bg-white border border-gray-300 shadow-sm focus-within:ring-2 focus-within:ring-blue-400 ${previewUrl ? 'rounded-2xl' : 'rounded-full'}`}>
+              <div className={`bg-white border border-gray-300 shadow-sm focus-within:ring-2 focus-within:ring-blue-400 ${(previewUrl || selectedFile) ? 'rounded-2xl' : 'rounded-full'}`}>
                 <form onSubmit={handleSendMessage} className="p-2">
-                  {previewUrl && (
-                    <div className="relative w-28 h-28 m-2 p-1 border rounded-lg bg-gray-100">
-                      <img src={previewUrl} alt="Preview" className="w-full h-full object-contain rounded-md" />
-                      <button onClick={cancelFileSelection} className="absolute -top-2 -right-2 bg-gray-600 text-white rounded-full p-0.5 hover:bg-red-500 transition-colors" type="button">
+                  {/* ⚡ Preview ที่รองรับหลายประเภท */}
+                  {selectedFile && (
+                    <div className="relative m-2 p-2 border rounded-lg bg-gray-50 inline-flex items-center gap-2">
+                      {fileType === "image" && previewUrl ? (
+                        <img src={previewUrl} alt="Preview" className="w-24 h-24 object-contain rounded-md" />
+                      ) : (
+                        <div className="flex items-center gap-2 px-2">
+                          <FilePreviewIcon fileType={fileType} className="w-8 h-8 text-blue-500" />
+                          <span className="text-sm text-gray-700 max-w-[150px] truncate">{selectedFile.name}</span>
+                        </div>
+                      )}
+                      <button 
+                        onClick={cancelFileSelection} 
+                        className="absolute -top-2 -right-2 bg-gray-600 text-white rounded-full p-0.5 hover:bg-red-500 transition-colors" 
+                        type="button"
+                      >
                         <XCircle size={20} />
                       </button>
                     </div>
                   )}
                   <div className="flex items-center space-x-2">
-                    <input type="file" ref={fileInputRef} onChange={handleFileSelect} className="hidden" accept="image/*" />
+                    {/* ⚡ เปลี่ยน accept ให้รองรับหลายประเภท */}
+                    <input 
+                      type="file" 
+                      ref={fileInputRef} 
+                      onChange={handleFileSelect} 
+                      className="hidden" 
+                      accept={ACCEPTED_FILE_TYPES} 
+                    />
                     <button type="button" onClick={() => fileInputRef.current.click()} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-gray-100 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed" aria-label="Attach file" disabled={isLoading}><Paperclip size={20} /></button>
                     <button type="button" onClick={() => setIsVoiceModalOpen(true)} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-gray-100 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed" aria-label="Use microphone" disabled={isLoading}><Mic size={20} /></button>
                     <input
@@ -602,10 +697,14 @@ function App() {
                       className="flex-1 bg-transparent focus:outline-none px-2 text-gray-800 placeholder-gray-500"
                       disabled={isLoading}
                     />
-                    <button type="submit" className="bg-blue-600 text-white p-2.5 rounded-full font-semibold hover:bg-blue-700 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed flex-shrink-0" disabled={isLoading || (!input.trim() && !imageFile)} aria-label="Send message"><Send size={20} /></button>
+                    <button type="submit" className="bg-blue-600 text-white p-2.5 rounded-full font-semibold hover:bg-blue-700 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed flex-shrink-0" disabled={isLoading || (!input.trim() && !selectedFile)} aria-label="Send message"><Send size={20} /></button>
                   </div>
                 </form>
               </div>
+              {/* ⚡ แสดงประเภทไฟล์ที่รองรับ */}
+              <p className="text-xs text-gray-400 text-center mt-2">
+                Supported: Images, Audio, PDF, TXT, CSV, JSON, DOC/DOCX
+              </p>
             </div>
           </footer>
         </div>
