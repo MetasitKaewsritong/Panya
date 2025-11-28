@@ -127,7 +127,7 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
                     pairs.append((sc, docs[idx]))
             except Exception as e:
                 logging.warning("⚠️ Flashrank failed, fallback to base scores: %s", e)
-                pairs = [(1.0 - float(d.metadata.get("distance", 1.0))), d]  # type: ignore
+                pairs = [(1.0 - float(d.metadata.get("distance", 1.0)), d) for d in docs]
         else:
             pairs = [(1.0 - float(d.metadata.get("distance", 1.0)), d) for d in docs]
 
@@ -155,7 +155,8 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
         return boosted
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
-        cand = self.base_retriever.get_relevant_documents(query) or []
+        # ✅ แก้จาก get_relevant_documents เป็น invoke
+        cand = self.base_retriever.invoke(query) or []
         if not cand:
             return []
         # ✅ จำกัดจำนวนที่ส่งเข้า Flashrank เพื่อความไว/เสถียร
@@ -175,5 +176,6 @@ class NoRerankRetriever(BaseRetriever):
     top_n: int = Field(default=8)
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
-        docs = self.base_retriever.get_relevant_documents(query) or []
+        # ✅ แก้จาก get_relevant_documents เป็น invoke
+        docs = self.base_retriever.invoke(query) or []
         return docs[: self.top_n]
