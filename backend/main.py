@@ -1,9 +1,10 @@
 # backend/main.py
-# ✅ VERSION 2.3 - แก้ไข:
-# 1. Auto mode แสดงเป็น "auto" ไม่ใช่ "deep" หรือ "fast"
-# 2. Deep mode ตอบละเอียดขึ้น
-# 3. รองรับ chat history (จำบทสนทนาเก่า)
-# 4. Web search fallback เมื่อไม่รู้คำตอบ
+# ✅ VERSION 2.4 - แก้ไข:
+# 1. ตอบได้ทุกเรื่อง ไม่ใช่แค่ PLCnext
+# 2. Web search ที่ใช้งานได้จริง (ใช้ DuckDuckGo HTML search)
+# 3. Auto mode แสดงเป็น "auto"
+# 4. Deep mode ตอบละเอียด
+# 5. Chat history support
 
 import os
 import logging
@@ -17,6 +18,7 @@ import io
 import mimetypes
 import warnings
 import json
+import re
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,15 +45,15 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 
 # ⚡ โหมดการอ่านไฟล์
-FAST_MODE_CHARS = 8000      # ~4 หน้า
-DEEP_MODE_CHARS = 60000     # ~30 หน้า
-AUTO_THRESHOLD = 10000      # ถ้าไฟล์ < 10,000 ใช้ Fast, ถ้า >= 10,000 ใช้ Deep
+FAST_MODE_CHARS = 8000
+DEEP_MODE_CHARS = 60000
+AUTO_THRESHOLD = 10000
 
-# ✅ Keywords ที่บ่งบอกว่าต้องใช้ Deep Mode (RAG)
+# Keywords สำหรับ PLCnext (ใช้ RAG)
 PLCNEXT_KEYWORDS = [
     "plcnext", "plc next", "phoenix contact", "axc", "axl", "axioline",
     "profinet", "modbus", "opcua", "opc ua", "gds", "global data space",
-    "esm", "execution", "synchronization", "firmware", "wbm", "web based management",
+    "esm", "execution", "synchronization", "firmware", "wbm",
     "iec 61131", "structured text", "function block", "ladder", "fbd",
     "proficloud", "plcnext store", "plcnext engineer"
 ]
@@ -88,36 +90,60 @@ def is_plcnext_specific_question(question: str) -> bool:
     return False
 
 
-# ✅ NEW: Web Search Function (ใช้ DuckDuckGo)
-def web_search(query: str, max_results: int = 3) -> str:
+# ✅ NEW: Web Search ที่ใช้งานได้จริง
+def web_search(query: str, max_results: int = 5) -> str:
     """
-    ค้นหาข้อมูลจากอินเทอร์เน็ตเมื่อไม่มีคำตอบ
-    ใช้ DuckDuckGo API (ไม่ต้อง API key)
+    ค้นหาข้อมูลจากอินเทอร์เน็ตโดยใช้ DuckDuckGo HTML
     """
     try:
-        # ใช้ DuckDuckGo Instant Answer API
-        url = f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1"
-        response = requests.get(url, timeout=10)
+        # ใช้ DuckDuckGo HTML search
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # URL encode query
+        from urllib.parse import quote_plus
+        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        
+        response = requests.get(search_url, headers=headers, timeout=10)
         
         if response.status_code == 200:
-            data = response.json()
+            # Parse HTML ง่ายๆ ด้วย regex
+            html = response.text
             
+            # หา snippets จาก result
             results = []
             
-            # Abstract (คำตอบหลัก)
-            if data.get("Abstract"):
-                results.append(f"**Summary:** {data['Abstract']}")
+            # Pattern สำหรับหา result snippets
+            snippet_pattern = r'<a class="result__snippet"[^>]*>(.*?)</a>'
+            snippets = re.findall(snippet_pattern, html, re.DOTALL)
             
-            # Related Topics
-            if data.get("RelatedTopics"):
-                for topic in data["RelatedTopics"][:max_results]:
-                    if isinstance(topic, dict) and topic.get("Text"):
-                        results.append(f"- {topic['Text']}")
+            for i, snippet in enumerate(snippets[:max_results]):
+                # ลบ HTML tags
+                clean_snippet = re.sub(r'<[^>]+>', '', snippet)
+                clean_snippet = clean_snippet.strip()
+                if clean_snippet:
+                    results.append(f"- {clean_snippet}")
+            
+            # หา titles ด้วย
+            title_pattern = r'<a class="result__a"[^>]*>(.*?)</a>'
+            titles = re.findall(title_pattern, html, re.DOTALL)
             
             if results:
+                logging.info(f"🌐 Web search found {len(results)} results for: {query[:50]}")
                 return "\n".join(results)
+            elif titles:
+                # ถ้าไม่มี snippets ให้ใช้ titles
+                clean_titles = []
+                for title in titles[:max_results]:
+                    clean_title = re.sub(r'<[^>]+>', '', title).strip()
+                    if clean_title:
+                        clean_titles.append(f"- {clean_title}")
+                return "\n".join(clean_titles)
         
+        logging.warning(f"⚠️ Web search returned status {response.status_code}")
         return ""
+        
     except Exception as e:
         logging.error(f"🔥 Web search error: {e}")
         return ""
@@ -259,20 +285,22 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
         return f"[Error reading file: {str(e)}]"
 
 
-# ✅ UPDATED: ถาม LLM โดยตรง พร้อม chat history
+# ✅ UPDATED: ถาม LLM โดยตรง - ตอบได้ทุกเรื่อง
 def ask_llm_directly(llm, question: str, file_content: str = "", filename: str = "", 
-                     mode: str = "auto", chat_history: List[dict] = None) -> dict:
+                     mode: str = "auto", chat_history: List[dict] = None,
+                     web_context: str = "") -> dict:
     """
-    ส่งคำถามไป LLM โดยตรง พร้อมรองรับ chat history
+    ส่งคำถามไป LLM โดยตรง - ตอบได้ทุกเรื่อง ไม่จำกัดแค่ PLCnext
     """
     start_time = time.perf_counter()
     
     # Build chat history string
     history_str = ""
     if chat_history:
-        for msg in chat_history[-10:]:  # เก็บแค่ 10 ข้อความล่าสุด
+        for msg in chat_history[-10:]:
             role = "User" if msg.get("sender") == "user" else "Assistant"
-            history_str += f"{role}: {msg.get('text', '')}\n"
+            text = msg.get("text", "")[:500]  # จำกัดความยาว
+            history_str += f"{role}: {text}\n"
     
     # Handle file content
     file_section = ""
@@ -284,29 +312,43 @@ def ask_llm_directly(llm, question: str, file_content: str = "", filename: str =
             file_content = file_content[:max_chars]
         
         file_section = f"""
---- Uploaded File: {filename} ---
+=== UPLOADED FILE: {filename} ===
 {file_content}
-{"[... truncated]" if truncated else ""}
----
+{"[... content truncated ...]" if truncated else ""}
+===
 """
     
-    # ✅ UPDATED: Prompt ที่ตอบละเอียดขึ้น
-    prompt = f"""You are a helpful AI assistant. You remember the conversation history and provide detailed, comprehensive answers.
+    # Web search section
+    web_section = ""
+    if web_context:
+        web_section = f"""
+=== WEB SEARCH RESULTS ===
+{web_context}
+===
+"""
+    
+    # ✅ UPDATED: Prompt ที่ตอบได้ทุกเรื่อง
+    prompt = f"""You are a helpful AI assistant that can answer questions on ANY topic.
+You are knowledgeable, friendly, and provide comprehensive answers.
 
-{"=== CONVERSATION HISTORY ===" + chr(10) + history_str if history_str else ""}
+{"=== CONVERSATION HISTORY ===" + chr(10) + history_str + "===" if history_str else ""}
 
 {file_section}
 
-User's question: {question}
+{web_section}
+
+**User's Question:** {question}
 
 **Instructions:**
-1. If this is a follow-up question, refer to the conversation history above.
-2. Provide a **detailed and comprehensive** answer.
-3. If discussing a document/file, give a **thorough summary** with key points.
-4. Answer in the **same language** as the user's question.
-5. Use bullet points and structure for clarity when appropriate.
+1. Answer the question thoroughly and helpfully
+2. If there is conversation history, use it to maintain context
+3. If there is file content, analyze and reference it
+4. If there are web search results, use them to provide accurate information
+5. Answer in the SAME LANGUAGE as the user's question (Thai/English)
+6. Be detailed and informative - don't give short, unhelpful answers
+7. You can discuss ANY topic - technology, science, entertainment, business, etc.
 
-**Your detailed response:**"""
+**Your comprehensive answer:**"""
 
     try:
         response = llm.invoke(prompt)
@@ -315,7 +357,7 @@ User's question: {question}
         return {
             "reply": response,
             "processing_time": total_time,
-            "mode": mode  # ✅ คงค่า mode เดิม (auto/fast/deep)
+            "mode": mode
         }
     except Exception as e:
         logging.error(f"🔥 Error asking LLM: {e}")
@@ -357,7 +399,7 @@ async def lifespan(app: FastAPI):
             app.state.llm = OllamaLLM(
                 model=OLLAMA_MODEL,
                 base_url=OLLAMA_BASE_URL,
-                temperature=0.0,
+                temperature=0.7,  # เพิ่มความคิดสร้างสรรค์
                 timeout=180
             )
             logging.info(f"✅ LLM ({OLLAMA_MODEL}) loaded.")
@@ -383,9 +425,9 @@ async def lifespan(app: FastAPI):
 # ---- App init ----
 app = FastAPI(
     lifespan=lifespan,
-    title="PLCnext Chatbot v2.3",
-    description="Advanced RAG chatbot with Chat History & Web Search",
-    version="2.3.0"
+    title="PLCnext Chatbot v2.4",
+    description="General AI Assistant with RAG for PLCnext + Web Search",
+    version="2.4.0"
 )
 
 app.add_middleware(
@@ -515,13 +557,13 @@ def chat_stream_get(message: str, collection: str = "plcnext", request: Request 
     )
 
 
-# ✅ UPDATED: agent-chat v2.3 พร้อม chat history และ web search
+# ✅ UPDATED: agent-chat v2.4 - ตอบได้ทุกเรื่อง + web search
 @app.post("/api/agent-chat")
 def agent_chat(
     message: str = Form(""),
     file: UploadFile = File(None),
     mode: str = Form("auto"),
-    chat_history: str = Form("[]"),  # ✅ NEW: รับ chat history จาก frontend
+    chat_history: str = Form("[]"),
     log_eval: bool = Form(False),
     enable_ragas: bool = Form(False),
     fast_ragas: bool | None = Form(None),
@@ -531,7 +573,7 @@ def agent_chat(
 ):
     start_time = time.perf_counter()
     
-    # ✅ Parse chat history
+    # Parse chat history
     try:
         history = json.loads(chat_history) if chat_history else []
     except:
@@ -541,10 +583,10 @@ def agent_chat(
     if mode not in ["auto", "fast", "deep"]:
         mode = "auto"
     
-    # ✅ เก็บ original mode ไว้แสดงผล
+    # เก็บ original mode ไว้แสดงผล
     display_mode = mode
     
-    # ตัดสินใจ internal mode (ใช้ภายในเท่านั้น)
+    # ตัดสินใจ internal mode
     internal_mode = mode
     file_text = ""
     file_content_bytes = None
@@ -567,6 +609,8 @@ def agent_chat(
                 internal_mode = "deep"
     else:
         if mode == "auto":
+            # ถ้าเกี่ยวกับ PLCnext → Deep (RAG)
+            # ถ้าไม่ → Fast (LLM + web search ถ้าจำเป็น)
             if is_plcnext_specific_question(message):
                 internal_mode = "deep"
             else:
@@ -575,43 +619,48 @@ def agent_chat(
     logging.info(f"🎯 Mode: {display_mode} (internal: {internal_mode})")
     
     # ====================================
-    # 🚀 FAST MODE
+    # 🚀 FAST MODE - ตอบได้ทุกเรื่อง
     # ====================================
     if internal_mode == "fast":
+        # ลอง search เว็บก่อนถ้าไม่ใช่คำถามทั่วไป
+        web_context = ""
+        
+        # ตรวจสอบว่าควร search หรือไม่
+        should_search = any([
+            "netflix" in message.lower(),
+            "google" in message.lower(),
+            "facebook" in message.lower(),
+            "amazon" in message.lower(),
+            "microsoft" in message.lower(),
+            "apple" in message.lower(),
+            "ข้อมูล" in message.lower(),
+            "บริษัท" in message.lower(),
+            "โครงสร้าง" in message.lower(),
+            "ราคา" in message.lower(),
+            "ข่าว" in message.lower(),
+            "ล่าสุด" in message.lower(),
+            "2024" in message.lower(),
+            "2025" in message.lower(),
+        ])
+        
+        if should_search:
+            logging.info(f"🌐 Searching web for: {message[:50]}...")
+            web_context = web_search(message)
+        
         result = ask_llm_directly(
             llm=app.state.llm,
             question=message,
             file_content=file_text,
             filename=file.filename if file else "",
-            mode=display_mode,  # ✅ ใช้ display_mode
-            chat_history=history
+            mode=display_mode,
+            chat_history=history,
+            web_context=web_context
         )
-        
-        reply_text = result.get("reply", "")
-        
-        # ✅ Web search fallback ถ้าตอบไม่ได้
-        if "ไม่พบข้อมูล" in reply_text or "I don't know" in reply_text or len(reply_text) < 50:
-            logging.info(f"🌐 Trying web search for: {message[:50]}...")
-            web_result = web_search(message)
-            if web_result:
-                # ถาม LLM อีกครั้งพร้อมข้อมูลจากเว็บ
-                enhanced_prompt = f"""Based on this web search result:
-{web_result}
-
-Please answer this question: {message}
-
-Provide a helpful and detailed answer in the same language as the question."""
-                
-                try:
-                    reply_text = app.state.llm.invoke(enhanced_prompt)
-                    logging.info(f"✅ Web search enhanced response")
-                except Exception as e:
-                    logging.error(f"🔥 Web search LLM error: {e}")
         
         total_time = time.perf_counter() - start_time
         
         response = {
-            "reply": reply_text,
+            "reply": result.get("reply", ""),
             "processing_time": total_time,
             "retrieval_time": 0,
             "context_count": 0,
@@ -620,12 +669,13 @@ Provide a helpful and detailed answer in the same language as the question."""
             "ragas": None,
             "use_rerank": False,
             "file_processed": file.filename if file else None,
-            "mode": display_mode  # ✅ แสดง auto/fast/deep ตามที่ user เลือก
+            "mode": display_mode,
+            "web_searched": bool(web_context)
         }
         return sanitize_json(response)
     
     # ====================================
-    # 🔍 DEEP MODE
+    # 🔍 DEEP MODE - RAG สำหรับ PLCnext
     # ====================================
     parsed_rerank = _to_bool(use_rerank)
     parsed_alias = _to_bool(use_rank)
@@ -635,10 +685,10 @@ Provide a helpful and detailed answer in the same language as the question."""
     use_rerank_flag = decided
     reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank_flag else NoRerankRetriever
     
-    # ✅ รวม chat history เข้ากับ message
+    # รวม chat history
     history_context = ""
     if history:
-        recent_history = history[-6:]  # เก็บแค่ 6 ข้อความล่าสุด
+        recent_history = history[-6:]
         for msg in recent_history:
             role = "User" if msg.get("sender") == "user" else "Assistant"
             history_context += f"{role}: {msg.get('text', '')[:200]}\n"
@@ -664,29 +714,21 @@ Provide a helpful and detailed answer in the same language as the question."""
     contexts = result.get("contexts_list") or result.get("contexts") or []
     reply_text = result.get("llm_answer", "") or result.get("reply", "")
     
-    # ✅ Fallback ถ้าไม่เจอข้อมูล
+    # Fallback ถ้าไม่เจอข้อมูล
     if "I could not find relevant information" in reply_text or not reply_text.strip():
-        logging.info(f"⚠️ Deep Mode: No context found, trying web search...")
+        logging.info(f"⚠️ Deep Mode: No context found, using general LLM...")
         
-        # ลอง web search ก่อน
-        web_result = web_search(message)
-        
-        fallback_prompt = f"""You are a helpful AI assistant.
-
-{"Web search results:" + chr(10) + web_result if web_result else ""}
-
-{"Previous conversation:" + chr(10) + history_context if history_context else ""}
-
-Question: {message}
-
-Please provide a **detailed and comprehensive** answer. If you have information from web search, use it.
-Answer in the same language as the question."""
-
-        try:
-            reply_text = app.state.llm.invoke(fallback_prompt)
-            logging.info(f"✅ Fallback response generated")
-        except Exception as e:
-            logging.error(f"🔥 Fallback error: {e}")
+        # ใช้ LLM โดยตรง
+        result = ask_llm_directly(
+            llm=app.state.llm,
+            question=message,
+            file_content=file_text,
+            filename=file.filename if file else "",
+            mode=display_mode,
+            chat_history=history,
+            web_context=""
+        )
+        reply_text = result.get("reply", "")
     
     total_time = time.perf_counter() - start_time
     logging.info(f"📊 Deep Mode: Time: {total_time:.2f}s")
@@ -701,7 +743,7 @@ Answer in the same language as the question."""
         "ragas": None,
         "use_rerank": use_rerank_flag,
         "file_processed": file.filename if file else None,
-        "mode": display_mode  # ✅ แสดง auto/fast/deep ตามที่ user เลือก
+        "mode": display_mode
     }
     return sanitize_json(response)
 
@@ -759,12 +801,13 @@ def get_stats(request: Request):
 @app.get("/")
 def root():
     return {
-        "message": "PLCnext Chatbot API v2.3",
+        "message": "PLCnext Chatbot API v2.4 - General AI Assistant",
         "features": [
+            "Answer ANY topic (not just PLCnext)",
             "Chat History Support",
-            "Web Search Fallback", 
-            "Smart Auto Mode",
-            "Detailed Deep Mode Responses"
+            "Web Search for current information", 
+            "RAG for PLCnext documentation",
+            "Multi-language support (Thai/English)"
         ],
         "endpoints": {
             "health": "/health",
@@ -774,9 +817,9 @@ def root():
             "stats": "/api/stats"
         },
         "modes": {
-            "auto": "Smart selection (shows as 'Auto' in response)",
-            "fast": "Direct LLM (~5-10s)",
-            "deep": "RAG + detailed response (~30-60s)"
+            "auto": "Smart: PLCnext → RAG, Others → LLM + Web Search",
+            "fast": "Direct LLM with web search (~5-15s)",
+            "deep": "RAG for PLCnext docs (~30-60s)"
         }
     }
 
