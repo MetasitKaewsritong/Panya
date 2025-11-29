@@ -36,6 +36,11 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 
+# ⚡ โหมดการอ่านไฟล์
+FAST_MODE_CHARS = 8000      # ~4 หน้า
+DEEP_MODE_CHARS = 60000     # ~30 หน้า
+AUTO_THRESHOLD = 10000      # ถ้าไฟล์ < 10,000 ใช้ Fast, ถ้า >= 10,000 ใช้ Deep
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.info("🔧 Configuration:")
 logging.info(f"  DB_URL: {DB_URL}")
@@ -208,6 +213,86 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
         return f"[Error reading file: {str(e)}]"
 
 
+# ⚡ ฟังก์ชันใหม่: ถาม LLM โดยตรง (ไม่ต้อง RAG) พร้อมรองรับ 3 โหมด
+def ask_llm_directly(llm, question: str, file_content: str, filename: str, mode: str = "auto") -> dict:
+    """
+    ส่งคำถามและเนื้อหาไฟล์ไป LLM โดยตรง (ไม่ต้องทำ RAG)
+    
+    Modes:
+    - auto: เลือกอัตโนมัติตามขนาดไฟล์
+    - fast: อ่านแค่ 8,000 ตัวอักษรแรก (~4 หน้า)
+    - deep: อ่านทั้งไฟล์ สูงสุด 60,000 ตัวอักษร (~30 หน้า)
+    """
+    start_time = time.perf_counter()
+    
+    original_length = len(file_content)
+    
+    # ⚡ เลือก max_chars ตามโหมด
+    if mode == "fast":
+        max_chars = FAST_MODE_CHARS
+        actual_mode = "fast"
+    elif mode == "deep":
+        max_chars = DEEP_MODE_CHARS
+        actual_mode = "deep"
+    else:  # auto
+        if original_length < AUTO_THRESHOLD:
+            max_chars = FAST_MODE_CHARS
+            actual_mode = "auto→fast"
+        else:
+            max_chars = DEEP_MODE_CHARS
+            actual_mode = "auto→deep"
+    
+    # ตัดเนื้อหาถ้ายาวเกินไป
+    truncated = False
+    if len(file_content) > max_chars:
+        file_content = file_content[:max_chars]
+        truncated = True
+    
+    logging.info(f"📖 Mode: {actual_mode} | Original: {original_length} chars | Using: {len(file_content)} chars | Truncated: {truncated}")
+    
+    # สร้าง prompt
+    prompt = f"""You are a helpful assistant. The user has uploaded a file named "{filename}".
+
+Here is the content of the file:
+---
+{file_content}
+{"... [content truncated due to length - showing first " + str(len(file_content)) + " characters]" if truncated else ""}
+---
+
+User's question: {question if question else "Please summarize this file."}
+
+Please answer based on the file content above. Answer in the same language as the user's question."""
+
+    try:
+        response = llm.invoke(prompt)
+        total_time = time.perf_counter() - start_time
+        
+        return {
+            "reply": response,
+            "processing_time": total_time,
+            "retrieval_time": 0,
+            "context_count": 0,
+            "contexts": [],
+            "mode": actual_mode,
+            "file_chars_used": len(file_content),
+            "file_chars_total": original_length,
+            "truncated": truncated
+        }
+    except Exception as e:
+        logging.error(f"🔥 Error asking LLM directly: {e}")
+        return {
+            "reply": f"Error processing file: {str(e)}",
+            "processing_time": time.perf_counter() - start_time,
+            "retrieval_time": 0,
+            "context_count": 0,
+            "contexts": [],
+            "mode": actual_mode,
+            "file_chars_used": len(file_content),
+            "file_chars_total": original_length,
+            "truncated": truncated
+        }
+
+
 # ---- FastAPI Lifespan ----
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -240,7 +325,7 @@ async def lifespan(app: FastAPI):
                 model=OLLAMA_MODEL,
                 base_url=OLLAMA_BASE_URL,
                 temperature=0.0,
-                timeout=120
+                timeout=180  # เพิ่ม timeout สำหรับ deep mode
             )
             logging.info(f"✅ LLM ({OLLAMA_MODEL}) loaded.")
         except Exception as e:
@@ -265,9 +350,9 @@ async def lifespan(app: FastAPI):
 # ---- App init ----
 app = FastAPI(
     lifespan=lifespan,
-    title="PLCnext Chatbot v2.0",
-    description="Advanced RAG chatbot for PLCnext Technology documentation",
-    version="2.0.0"
+    title="PLCnext Chatbot v2.1",
+    description="Advanced RAG chatbot with Auto/Fast/Deep modes",
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -397,11 +482,15 @@ def chat_stream_get(message: str, collection: str = "plcnext", request: Request 
     )
 
 
-# ⚡ แก้ไข agent-chat ให้รองรับไฟล์หลายประเภท
+# ⚡ agent-chat พร้อม 3 โหมด: auto, fast, deep
+# Fast = Direct to LLM (เร็ว)
+# Deep = RAG (ช้า แต่ละเอียด ใช้ข้อมูลจาก database)
+# Auto = เลือกอัตโนมัติ
 @app.post("/api/agent-chat")
 def agent_chat(
     message: str = Form(""),
     file: UploadFile = File(None),
+    mode: str = Form("auto"),  # ⚡ auto, fast, deep
     log_eval: bool = Form(False),
     enable_ragas: bool = Form(False),
     fast_ragas: bool | None = Form(None),
@@ -409,35 +498,122 @@ def agent_chat(
     use_rerank: Any = Form(None),
     use_rank: Any = Form(None),
 ):
+    start_time = time.perf_counter()
+    
+    # ⚡ Validate mode
+    if mode not in ["auto", "fast", "deep"]:
+        mode = "auto"
+    
+    # ⚡ ตัดสินใจโหมดจริงที่จะใช้
+    # Auto logic: ถ้ามีไฟล์ใหญ่ → Fast, ถ้าไม่มีไฟล์หรือไฟล์เล็ก → Deep
+    actual_mode = mode
+    file_text = ""
+    file_content_bytes = None
+    mime_type = None
+    
+    if file:
+        file_content_bytes = file.file.read()
+        mime_type, _ = mimetypes.guess_type(file.filename)
+        
+        # Audio files - ใช้ transcribe endpoint แทน
+        if mime_type and mime_type.startswith("audio"):
+            return {"error": "Please use /api/transcribe for audio files"}
+        
+        # Extract text จากไฟล์
+        file_text = extract_text_from_file(file_content_bytes, file.filename, mime_type)
+        logging.info(f"📄 Extracted {len(file_text)} characters from {file.filename}")
+        
+        # Auto mode logic สำหรับไฟล์
+        if mode == "auto":
+            if len(file_text) > AUTO_THRESHOLD:
+                actual_mode = "fast"  # ไฟล์ใหญ่ → Fast
+            else:
+                actual_mode = "deep"  # ไฟล์เล็ก → Deep (ละเอียดกว่า)
+    else:
+        # ไม่มีไฟล์ - Auto จะใช้ Deep (RAG)
+        if mode == "auto":
+            actual_mode = "deep"
+    
+    # ====================================
+    # 🚀 FAST MODE: Direct to LLM (เร็ว)
+    # ====================================
+    if actual_mode == "fast":
+        if file_text:
+            # มีไฟล์ → ส่งไฟล์ไป LLM โดยตรง
+            result = ask_llm_directly(
+                llm=app.state.llm,
+                question=message,
+                file_content=file_text,
+                filename=file.filename if file else "unknown"
+            )
+            
+            total_time = time.perf_counter() - start_time
+            logging.info(f"📊 Fast Mode (File): {file.filename} | Time: {total_time:.2f}s")
+            
+            response = {
+                "reply": result.get("reply", ""),
+                "processing_time": total_time,
+                "retrieval_time": 0,
+                "context_count": 0,
+                "contexts": [],
+                "eval": None,
+                "ragas": None,
+                "use_rerank": False,
+                "file_processed": file.filename if file else None,
+                "mode": "fast",
+                "file_info": {
+                    "chars_used": result.get("file_chars_used"),
+                    "chars_total": result.get("file_chars_total"),
+                    "truncated": result.get("truncated")
+                }
+            }
+            return sanitize_json(response)
+        else:
+            # ไม่มีไฟล์ → ถาม LLM โดยตรง (ไม่ใช้ RAG)
+            try:
+                llm_response = app.state.llm.invoke(message)
+                total_time = time.perf_counter() - start_time
+                logging.info(f"📊 Fast Mode (No File): Time: {total_time:.2f}s")
+                
+                response = {
+                    "reply": llm_response,
+                    "processing_time": total_time,
+                    "retrieval_time": 0,
+                    "context_count": 0,
+                    "contexts": [],
+                    "eval": None,
+                    "ragas": None,
+                    "use_rerank": False,
+                    "file_processed": None,
+                    "mode": "fast"
+                }
+                return sanitize_json(response)
+            except Exception as e:
+                logging.error(f"🔥 Fast mode error: {e}")
+                return {"error": str(e), "mode": "fast"}
+    
+    # ====================================
+    # 🔍 DEEP MODE: RAG (ช้า แต่ละเอียด)
+    # ====================================
+    # ใช้ RAG - embed + search database + LLM
+    
     parsed_rerank = _to_bool(use_rerank)
-    parsed_alias  = _to_bool(use_rank)
+    parsed_alias = _to_bool(use_rank)
     decided = parsed_rerank if parsed_rerank is not None else parsed_alias
     if decided is None:
         decided = os.getenv("USE_RERANK_DEFAULT", "true").strip().lower() in ("1","true","yes","y","on")
-    use_rerank = decided
-    reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank else NoRerankRetriever
-
-    # ⚡ ปรับปรุงการจัดการไฟล์
-    file_text = ""
-    if file:
-        content = file.file.read()
-        mime_type, _ = mimetypes.guess_type(file.filename)
-        
-        # ⚡ รองรับไฟล์หลายประเภท
-        if mime_type and mime_type.startswith("audio"):
-            # Audio files - ใช้ transcribe endpoint แทน
-            return {"error": "Please use /api/transcribe for audio files"}
-        else:
-            # ทุกประเภทอื่นๆ - extract text
-            file_text = extract_text_from_file(content, file.filename, mime_type)
-            logging.info(f"📄 Extracted {len(file_text)} characters from {file.filename}")
+    use_rerank_flag = decided
+    reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank_flag else NoRerankRetriever
     
-    # รวม message กับ file content
+    # รวม message กับ file content (ถ้ามี)
     combined_message = message
     if file_text:
-        combined_message = f"{message}\n\n--- File Content ({file.filename if file else 'unknown'}) ---\n{file_text}"
+        # ตัดให้สั้นลงถ้ายาวเกินไป เพื่อไม่ให้ embed ช้าเกินไป
+        truncated_file_text = file_text[:DEEP_MODE_CHARS] if len(file_text) > DEEP_MODE_CHARS else file_text
+        combined_message = f"{message}\n\n--- File Content ({file.filename}) ---\n{truncated_file_text}"
+        if len(file_text) > DEEP_MODE_CHARS:
+            combined_message += f"\n[... truncated, showing first {DEEP_MODE_CHARS} of {len(file_text)} characters]"
 
-    start_time = time.perf_counter()
     result = answer_question(
         question=combined_message,
         db_pool=app.state.db_pool,
@@ -450,6 +626,8 @@ def agent_chat(
     total_time = time.perf_counter() - start_time
 
     contexts = result.get("contexts_list") or result.get("contexts") or []
+    
+    logging.info(f"📊 Deep Mode (RAG): Query length: {len(combined_message)} | Time: {total_time:.2f}s")
 
     response = {
         "reply": result.get("llm_answer", "") or result.get("reply", ""),
@@ -459,8 +637,9 @@ def agent_chat(
         "contexts": contexts,
         "eval": None,
         "ragas": None,
-        "use_rerank": use_rerank,
+        "use_rerank": use_rerank_flag,
         "file_processed": file.filename if file else None,
+        "mode": "deep"
     }
     return sanitize_json(response)
 
@@ -517,7 +696,7 @@ def get_stats(request: Request):
 @app.get("/")
 def root():
     return {
-        "message": "PLCnext Chatbot API v2.0",
+        "message": "PLCnext Chatbot API v2.1",
         "endpoints": {
             "health": "/health",
             "chat": "/api/chat",
@@ -526,7 +705,12 @@ def root():
             "collections": "/api/collections",
             "stats": "/api/stats"
         },
-        "supported_files": ["image/*", "audio/*", "pdf", "txt", "csv", "json", "docx"]
+        "supported_files": ["image/*", "audio/*", "pdf", "txt", "csv", "json", "docx"],
+        "modes": {
+            "auto": "Automatically choose: large files → Fast, small files/no file → Deep",
+            "fast": "Direct to LLM - Fast response (~5-10s), no database search",
+            "deep": "RAG mode - Slower (~30-60s) but uses database knowledge for detailed answers"
+        }
     }
 
 @app.post("/api/transcribe")

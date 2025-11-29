@@ -1,4 +1,4 @@
-// App.jsx (fixed: null-safe render + use reply field from backend)
+// App.jsx - with Auto/Fast/Deep mode selector
 import { useState, useEffect, useRef } from "react";
 import axios from "axios";
 import {
@@ -18,6 +18,10 @@ import {
   FileText,
   FileAudio,
   Image as ImageIcon,
+  Zap,
+  Gauge,
+  Brain,
+  ChevronDown,
 } from "lucide-react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -71,6 +75,72 @@ const FilePreviewIcon = ({ fileType, className }) => {
   }
 };
 
+// ⚡ Mode Selector Component - แสดงตลอดเวลา
+const ModeSelector = ({ mode, setMode, disabled }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  
+  const modes = [
+    { id: "auto", label: "Auto", icon: Brain, description: "เลือกอัตโนมัติตามสถานการณ์", color: "text-purple-600" },
+    { id: "fast", label: "Fast", icon: Zap, description: "เร็ว ~5-10 วินาที (ไม่ใช้ database)", color: "text-yellow-600" },
+    { id: "deep", label: "Deep", icon: Gauge, description: "ละเอียด ~30-60 วินาที (ใช้ RAG + database)", color: "text-blue-600" },
+  ];
+  
+  const currentMode = modes.find(m => m.id === mode) || modes[0];
+  const CurrentIcon = currentMode.icon;
+  
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => !disabled && setIsOpen(!isOpen)}
+        disabled={disabled}
+        className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border transition-all text-sm font-medium
+          ${disabled ? 'opacity-50 cursor-not-allowed bg-gray-100' : 'hover:bg-gray-50 cursor-pointer'}
+          ${currentMode.color} border-gray-300`}
+      >
+        <CurrentIcon size={16} />
+        <span>{currentMode.label}</span>
+        <ChevronDown size={14} className={`transition-transform ${isOpen ? 'rotate-180' : ''}`} />
+      </button>
+      
+      {isOpen && !disabled && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setIsOpen(false)} />
+          <div className="absolute bottom-full left-0 mb-2 w-64 bg-white rounded-xl shadow-lg border border-gray-200 overflow-hidden z-20">
+            <div className="p-2 border-b bg-gray-50">
+              <p className="text-xs text-gray-500 font-medium">เลือกโหมดการอ่านไฟล์</p>
+            </div>
+            {modes.map((m) => {
+              const Icon = m.icon;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => {
+                    setMode(m.id);
+                    setIsOpen(false);
+                  }}
+                  className={`w-full flex items-start gap-3 p-3 hover:bg-gray-50 transition-colors text-left
+                    ${mode === m.id ? 'bg-blue-50' : ''}`}
+                >
+                  <Icon size={20} className={m.color} />
+                  <div>
+                    <p className={`font-medium ${m.color}`}>{m.label}</p>
+                    <p className="text-xs text-gray-500">{m.description}</p>
+                  </div>
+                  {mode === m.id && (
+                    <Check size={16} className="ml-auto text-blue-600" />
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
 const CodeBlock = ({ language, value }) => {
   const [isCopied, setIsCopied] = useState(false);
   const handleCopy = () => {
@@ -108,7 +178,6 @@ const CodeBlock = ({ language, value }) => {
 };
 
 const MessageContent = ({ text }) => {
-  // ทำให้ปลอดภัยเสมอ (ไม่ให้ undefined/null มาพัง .split)
   const safeText = String(text ?? "");
   const codeBlockRegex = /```(\w+)?\n([\s\S]+?)\n```/g;
   const parts = safeText.split(codeBlockRegex);
@@ -132,7 +201,7 @@ const MessageContent = ({ text }) => {
   );
 };
 
-const Message = ({ text, sender, image, fileName, fileType }) => {
+const Message = ({ text, sender, image, fileName, fileType, mode }) => {
   const isUser = sender === "user";
   return (
     <div className={`flex items-start gap-3 ${isUser ? "justify-end" : ""} my-4`}>
@@ -142,6 +211,22 @@ const Message = ({ text, sender, image, fileName, fileType }) => {
         </div>
       )}
       <div className={`max-w-2xl px-5 py-3 rounded-xl shadow-sm break-words ${isUser ? "bg-blue-600 text-white" : "bg-white text-gray-800 border"}`}>
+        {/* ⚡ แสดง mode badge ถ้ามี */}
+        {mode && !isUser && (
+          <div className="flex items-center gap-1 mb-2">
+            <span className={`text-xs px-2 py-0.5 rounded-full ${
+              mode.includes('fast') ? 'bg-yellow-100 text-yellow-700' :
+              mode.includes('deep') ? 'bg-blue-100 text-blue-700' :
+              mode === 'rag' ? 'bg-green-100 text-green-700' :
+              'bg-purple-100 text-purple-700'
+            }`}>
+              {mode.includes('fast') ? '⚡ Fast' :
+               mode.includes('deep') ? '🔍 Deep' :
+               mode === 'rag' ? '📚 RAG' :
+               '🤖 ' + mode}
+            </span>
+          </div>
+        )}
         {/* ⚡ แสดง preview ตามประเภทไฟล์ */}
         {image && fileType === "image" && (
           <img src={image} alt="upload" className="mb-2 max-h-40 rounded border" />
@@ -274,9 +359,16 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null); 
-  const [selectedFile, setSelectedFile] = useState(null);  // ⚡ เปลี่ยนชื่อจาก imageFile
+  const [selectedFile, setSelectedFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
-  const [fileType, setFileType] = useState(null);  // ⚡ เพิ่ม state สำหรับเก็บประเภทไฟล์
+  const [fileType, setFileType] = useState(null);
+  
+  // ⚡ เพิ่ม state สำหรับ mode
+  const [fileMode, setFileMode] = useState("auto");
+  
+  // ⚡ เพิ่ม state สำหรับ upload progress
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [isUploading, setIsUploading] = useState(false);
 
   // voice modal state
   const [isVoiceModalOpen, setIsVoiceModalOpen] = useState(false);
@@ -288,13 +380,13 @@ function App() {
 
   // ⚡ รายการประเภทไฟล์ที่รองรับ
   const ACCEPTED_FILE_TYPES = [
-    "image/*",           // รูปภาพทุกประเภท
-    "audio/*",           // เสียงทุกประเภท
-    ".pdf",              // PDF
-    ".txt",              // Text
-    ".csv",              // CSV
-    ".json",             // JSON
-    ".doc,.docx",        // Word documents
+    "image/*",
+    "audio/*",
+    ".pdf",
+    ".txt",
+    ".csv",
+    ".json",
+    ".doc,.docx",
   ].join(",");
 
   useEffect(() => {
@@ -390,7 +482,7 @@ function App() {
     setConfirmDeleteId(null);
   };
 
-  // 5. File preview - ⚡ แก้ไขให้รองรับหลายประเภท
+  // 5. File preview
   const handleFileSelect = (event) => {
     const file = event.target.files[0];
     if (!file) return;
@@ -399,7 +491,6 @@ function App() {
     setSelectedFile(file);
     setFileType(detectedType);
     
-    // สร้าง preview URL เฉพาะไฟล์รูปภาพ
     if (detectedType === "image") {
       setPreviewUrl(URL.createObjectURL(file));
     } else {
@@ -415,11 +506,11 @@ function App() {
     setFileType(null);
   };
 
-  // 6. Send Message - ⚡ แก้ไขให้รองรับหลายประเภท
+  // 6. Send Message - ⚡ เพิ่ม mode parameter และ upload progress
   const handleSendMessage = async (e) => {
     e.preventDefault();
     const userText = input.trim();
-    if ((!userText && !selectedFile) || isLoading || !activeChatId) return;
+    if ((!userText && !selectedFile) || isLoading || isUploading || !activeChatId) return;
 
     const userMessage = {
       text: userText,
@@ -453,16 +544,29 @@ function App() {
     try {
       const formData = new FormData();
       formData.append("message", userText);
+      formData.append("mode", fileMode);  // ⚡ ส่ง mode ไปด้วย
       if (selectedFile) {
         formData.append("file", selectedFile);
       }
+      
+      // ⚡ ใช้ axios พร้อม onUploadProgress
       const response = await axios.post(
         `${API_URL}/api/agent-chat`,
         formData,
-        { headers: { "Content-Type": "multipart/form-data" } }
+        { 
+          headers: { "Content-Type": "multipart/form-data" },
+          onUploadProgress: (progressEvent) => {
+            const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            setUploadProgress(percentCompleted);
+            if (percentCompleted < 100) {
+              setIsUploading(true);
+            } else {
+              setIsUploading(false);
+            }
+          }
+        }
       );
 
-      // ✅ ใช้ 'reply' จาก backend (fallback เผื่อมีเวอร์ชันเก่า)
       const botText =
         typeof response.data?.reply === "string"
           ? response.data.reply
@@ -470,8 +574,11 @@ function App() {
           ? response.data.answer
           : "";
 
-      const botMessage = { text: (response.data.reply ?? response.data.answer ?? ""), sender: "bot" };
-
+      const botMessage = { 
+        text: (response.data.reply ?? response.data.answer ?? ""), 
+        sender: "bot",
+        mode: response.data.mode || null  // ⚡ เก็บ mode ที่ใช้
+      };
 
       setChatHistory((prev) => {
         const newHistory = [...prev];
@@ -500,6 +607,8 @@ function App() {
       });
     } finally {
       setIsLoading(false);
+      setIsUploading(false);
+      setUploadProgress(0);
       setSelectedFile(null);
       setPreviewUrl(null);
       setFileType(null);
@@ -634,6 +743,7 @@ function App() {
                   image={msg.image}
                   fileName={msg.fileName}
                   fileType={msg.fileType}
+                  mode={msg.mode}
                 />
               ))}
               {isLoading && (
@@ -656,9 +766,9 @@ function App() {
           {/* Footer/INPUT bar */}
           <footer className="p-4 bg-gray-100/80 backdrop-blur-sm">
             <div className="max-w-4xl mx-auto">
-              <div className={`bg-white border border-gray-300 shadow-sm focus-within:ring-2 focus-within:ring-blue-400 ${(previewUrl || selectedFile) ? 'rounded-2xl' : 'rounded-full'}`}>
+              <div className={`bg-white border border-gray-300 shadow-sm focus-within:ring-2 focus-within:ring-blue-400 ${(previewUrl || selectedFile) ? 'rounded-2xl' : 'rounded-2xl'}`}>
                 <form onSubmit={handleSendMessage} className="p-2">
-                  {/* ⚡ Preview ที่รองรับหลายประเภท */}
+                  {/* ⚡ Preview ที่รองรับหลายประเภท + Progress Bar */}
                   {selectedFile && (
                     <div className="relative m-2 p-2 border rounded-lg bg-gray-50 inline-flex items-center gap-2">
                       {fileType === "image" && previewUrl ? (
@@ -666,20 +776,37 @@ function App() {
                       ) : (
                         <div className="flex items-center gap-2 px-2">
                           <FilePreviewIcon fileType={fileType} className="w-8 h-8 text-blue-500" />
-                          <span className="text-sm text-gray-700 max-w-[150px] truncate">{selectedFile.name}</span>
+                          <div className="flex flex-col">
+                            <span className="text-sm text-gray-700 max-w-[150px] truncate">{selectedFile.name}</span>
+                            <span className="text-xs text-gray-400">
+                              {(selectedFile.size / 1024).toFixed(1)} KB
+                            </span>
+                          </div>
                         </div>
+                      )}
+                      {/* ⚡ Progress Bar */}
+                      {isUploading && (
+                        <div className="absolute bottom-0 left-0 right-0 h-1 bg-gray-200 rounded-b-lg overflow-hidden">
+                          <div 
+                            className="h-full bg-blue-500 transition-all duration-300"
+                            style={{ width: `${uploadProgress}%` }}
+                          />
+                        </div>
+                      )}
+                      {isUploading && (
+                        <span className="text-xs text-blue-600 font-medium">{uploadProgress}%</span>
                       )}
                       <button 
                         onClick={cancelFileSelection} 
                         className="absolute -top-2 -right-2 bg-gray-600 text-white rounded-full p-0.5 hover:bg-red-500 transition-colors" 
                         type="button"
+                        disabled={isUploading}
                       >
                         <XCircle size={20} />
                       </button>
                     </div>
                   )}
                   <div className="flex items-center space-x-2">
-                    {/* ⚡ เปลี่ยน accept ให้รองรับหลายประเภท */}
                     <input 
                       type="file" 
                       ref={fileInputRef} 
@@ -687,6 +814,8 @@ function App() {
                       className="hidden" 
                       accept={ACCEPTED_FILE_TYPES} 
                     />
+                    {/* ⚡ Mode Selector - แสดงตลอดเวลา */}
+                    <ModeSelector mode={fileMode} setMode={setFileMode} disabled={isLoading} />
                     <button type="button" onClick={() => fileInputRef.current.click()} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-gray-100 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed" aria-label="Attach file" disabled={isLoading}><Paperclip size={20} /></button>
                     <button type="button" onClick={() => setIsVoiceModalOpen(true)} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-gray-100 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed" aria-label="Use microphone" disabled={isLoading}><Mic size={20} /></button>
                     <input
@@ -697,7 +826,9 @@ function App() {
                       className="flex-1 bg-transparent focus:outline-none px-2 text-gray-800 placeholder-gray-500"
                       disabled={isLoading}
                     />
-                    <button type="submit" className="bg-blue-600 text-white p-2.5 rounded-full font-semibold hover:bg-blue-700 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed flex-shrink-0" disabled={isLoading || (!input.trim() && !selectedFile)} aria-label="Send message"><Send size={20} /></button>
+                    <button type="submit" className="bg-blue-600 text-white p-2.5 rounded-full font-semibold hover:bg-blue-700 shadow-sm disabled:bg-blue-300 disabled:cursor-not-allowed flex-shrink-0" disabled={isLoading || isUploading || (!input.trim() && !selectedFile)} aria-label="Send message">
+                      {isUploading ? <LoaderCircle size={20} className="animate-spin" /> : <Send size={20} />}
+                    </button>
                   </div>
                 </form>
               </div>
