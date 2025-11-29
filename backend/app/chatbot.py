@@ -21,21 +21,26 @@ def preprocess_query(query: str) -> str:
 
 
 def build_enhanced_prompt() -> PromptTemplate:
+    # ✅ FIXED: แก้ prompt ให้ fallback ได้เมื่อไม่เจอข้อมูลใน context
     template = """You are a specialized AI assistant for Phoenix Contact's PLCnext Technology platform.
+
 **CONTEXT:**
 {context}
+
 **RESPONSE RULES:**
 1. **GOLDEN ANSWERS PRIORITY:** If context contains "Question:...Answer:" pairs, you MUST use them verbatim.
-2. **TECHNICAL PRECISION:** Include specific technical details, model numbers, and specifications.
+2. **TECHNICAL PRECISION:** Include specific technical details, model numbers, and specifications when available.
 3. **STRUCTURED ANSWERS:** For technical questions, provide a direct answer first, followed by specifications if relevant.
-4. **PROTOCOL/MODE PRIORITY:** If the user question asks about 'protocol', 'communication mode', 'interface', or related topics, you must extract and clearly display protocol/mode information from the context. If not found, say: "I could not find protocol/mode information in the PLCnext documentation."
-5. **CONTEXT ONLY:** Base answers exclusively on the provided context.
-6. **NO INFO RESPONSE:** If no relevant info is found, respond with ONLY: "I could not find relevant information in the PLCnext documentation."
-7. **LANGUAGE:** Answer in English language.
+4. **PROTOCOL/MODE PRIORITY:** If the user question asks about 'protocol', 'communication mode', 'interface', or related topics, you must extract and clearly display protocol/mode information from the context.
+5. **CONTEXT FIRST:** Prioritize information from the provided context.
+6. **KNOWLEDGE FALLBACK:** If no relevant info is found in the context, answer based on your general knowledge about PLCnext Technology, Phoenix Contact products, and industrial automation. Make it clear when you're using general knowledge vs. specific documentation.
+7. **LANGUAGE:** Answer in the same language as the user's question. If the question is in Thai, answer in Thai. If in English, answer in English.
 
 **QUESTION:** {question}
+
 **TECHNICAL ANSWER:**"""
     return PromptTemplate(input_variables=["context", "question"], template=template)
+
 
 def log_query_performance(query: str, response: str, retrieval_time: float, total_time: float, context_count: int):
     import logging
@@ -90,7 +95,12 @@ def answer_question(
     context_count = len(context_texts)
 
     prompt = build_enhanced_prompt()
-    context_str = "\n".join(f"- {c}" for c in context_texts)
+    
+    # ✅ FIXED: ถ้าไม่มี context ให้บอก LLM ว่าให้ใช้ความรู้ทั่วไป
+    if context_texts:
+        context_str = "\n".join(f"- {c}" for c in context_texts)
+    else:
+        context_str = "(No specific documentation found. Please answer based on your general knowledge about PLCnext Technology.)"
 
     rag_chain = (
         {"context": (lambda _: context_str), "question": RunnablePassthrough()}
@@ -154,7 +164,12 @@ def answer_question_stream(
 
     context_texts = [d.page_content for d in retrieved_docs][:top_k]
     context_count = len(context_texts)
-    context_str = "\n".join(f"- {c}" for c in context_texts)
+    
+    # ✅ FIXED: ถ้าไม่มี context ให้บอก LLM ว่าให้ใช้ความรู้ทั่วไป
+    if context_texts:
+        context_str = "\n".join(f"- {c}" for c in context_texts)
+    else:
+        context_str = "(No specific documentation found. Please answer based on your general knowledge about PLCnext Technology.)"
 
     # ส่ง metadata ก่อน (retrieval เสร็จแล้ว)
     yield f"data: {json.dumps({'type': 'metadata', 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count})}\n\n"

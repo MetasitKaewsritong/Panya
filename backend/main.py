@@ -1,4 +1,5 @@
 # backend/main.py
+# ✅ FIXED VERSION - แก้ปัญหา Auto Mode เลือก Deep ตลอด และ Deep ไม่ตอบ
 
 import os
 import logging
@@ -41,6 +42,15 @@ FAST_MODE_CHARS = 8000      # ~4 หน้า
 DEEP_MODE_CHARS = 60000     # ~30 หน้า
 AUTO_THRESHOLD = 10000      # ถ้าไฟล์ < 10,000 ใช้ Fast, ถ้า >= 10,000 ใช้ Deep
 
+# ✅ NEW: Keywords ที่บ่งบอกว่าต้องใช้ Deep Mode (RAG)
+PLCNEXT_KEYWORDS = [
+    "plcnext", "plc next", "phoenix contact", "axc", "axl", "axioline",
+    "profinet", "modbus", "opcua", "opc ua", "gds", "global data space",
+    "esm", "execution", "synchronization", "firmware", "wbm", "web based management",
+    "iec 61131", "structured text", "function block", "ladder", "fbd",
+    "proficloud", "plcnext store", "plcnext engineer"
+]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.info("🔧 Configuration:")
 logging.info(f"  DB_URL: {DB_URL}")
@@ -62,6 +72,21 @@ def _to_bool(val: Any) -> Optional[bool]:
     if s in ("0", "false", "no", "n", "off"):
         return False
     return None
+
+
+# ✅ NEW: ฟังก์ชันตรวจสอบว่าคำถามเกี่ยวกับ PLCnext หรือไม่
+def is_plcnext_specific_question(question: str) -> bool:
+    """
+    ตรวจสอบว่าคำถามเกี่ยวกับ PLCnext โดยเฉพาะหรือไม่
+    ถ้าใช่ → ควรใช้ Deep Mode (RAG)
+    ถ้าไม่ → ใช้ Fast Mode (LLM โดยตรง)
+    """
+    question_lower = question.lower()
+    for keyword in PLCNEXT_KEYWORDS:
+        if keyword in question_lower:
+            return True
+    return False
+
 
 def wait_for_ollama():
     logging.info("🔄 Checking Ollama service readiness...")
@@ -350,9 +375,9 @@ async def lifespan(app: FastAPI):
 # ---- App init ----
 app = FastAPI(
     lifespan=lifespan,
-    title="PLCnext Chatbot v2.1",
-    description="Advanced RAG chatbot with Auto/Fast/Deep modes",
-    version="2.1.0"
+    title="PLCnext Chatbot v2.2",
+    description="Advanced RAG chatbot with Smart Auto/Fast/Deep modes",
+    version="2.2.0"
 )
 
 app.add_middleware(
@@ -402,6 +427,13 @@ def chat(fastapi_request: Request, chat_request: ChatRequest):
     llm = fastapi_request.app.state.llm
     embedder = fastapi_request.app.state.embedder
 
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM not available")
+    if not embedder:
+        raise HTTPException(status_code=503, detail="Embedder not available")
+
     result = answer_question(
         question=chat_request.message,
         db_pool=db_pool,
@@ -409,18 +441,11 @@ def chat(fastapi_request: Request, chat_request: ChatRequest):
         embedder=embedder,
         collection=chat_request.collection,
         retriever_class=PostgresVectorRetriever,
-        reranker_class=EnhancedFlashrankRerankRetriever
+        reranker_class=EnhancedFlashrankRerankRetriever,
     )
+    return ChatResponse(**result)
 
-    return ChatResponse(
-        reply=result["reply"],
-        processing_time=result.get("processing_time"),
-        retrieval_time=result.get("retrieval_time"),
-        context_count=result.get("context_count"),
-        ragas=None
-    )
 
-# ⚡ Streaming endpoint
 @app.post("/api/chat/stream")
 def chat_stream(fastapi_request: Request, chat_request: ChatRequest):
     db_pool = fastapi_request.app.state.db_pool
@@ -485,7 +510,7 @@ def chat_stream_get(message: str, collection: str = "plcnext", request: Request 
 # ⚡ agent-chat พร้อม 3 โหมด: auto, fast, deep
 # Fast = Direct to LLM (เร็ว)
 # Deep = RAG (ช้า แต่ละเอียด ใช้ข้อมูลจาก database)
-# Auto = เลือกอัตโนมัติ
+# Auto = เลือกอัตโนมัติ (✅ FIXED: ฉลาดขึ้น!)
 @app.post("/api/agent-chat")
 def agent_chat(
     message: str = Form(""),
@@ -504,8 +529,7 @@ def agent_chat(
     if mode not in ["auto", "fast", "deep"]:
         mode = "auto"
     
-    # ⚡ ตัดสินใจโหมดจริงที่จะใช้
-    # Auto logic: ถ้ามีไฟล์ใหญ่ → Fast, ถ้าไม่มีไฟล์หรือไฟล์เล็ก → Deep
+    # ✅ FIXED: ตัดสินใจโหมดจริงที่จะใช้ (ฉลาดขึ้น!)
     actual_mode = mode
     file_text = ""
     file_content_bytes = None
@@ -530,9 +554,15 @@ def agent_chat(
             else:
                 actual_mode = "deep"  # ไฟล์เล็ก → Deep (ละเอียดกว่า)
     else:
-        # ไม่มีไฟล์ - Auto จะใช้ Deep (RAG)
+        # ✅ FIXED: ไม่มีไฟล์ - Auto จะเลือกตามประเภทคำถาม
         if mode == "auto":
-            actual_mode = "deep"
+            # ตรวจสอบว่าคำถามเกี่ยวกับ PLCnext หรือไม่
+            if is_plcnext_specific_question(message):
+                actual_mode = "deep"  # คำถามเกี่ยวกับ PLCnext → Deep (RAG)
+                logging.info(f"🎯 Auto Mode: Detected PLCnext-specific question → Deep")
+            else:
+                actual_mode = "fast"  # คำถามทั่วไป → Fast (เร็วกว่า)
+                logging.info(f"⚡ Auto Mode: General question → Fast")
     
     # ====================================
     # 🚀 FAST MODE: Direct to LLM (เร็ว)
@@ -626,11 +656,32 @@ def agent_chat(
     total_time = time.perf_counter() - start_time
 
     contexts = result.get("contexts_list") or result.get("contexts") or []
+    reply_text = result.get("llm_answer", "") or result.get("reply", "")
+    
+    # ✅ FIXED: ถ้า RAG หาไม่เจอ ให้ fallback ไปใช้ LLM โดยตรง
+    if "I could not find relevant information" in reply_text or not reply_text.strip():
+        logging.info(f"⚠️ Deep Mode: No relevant context found, falling back to LLM...")
+        try:
+            # Fallback: ถาม LLM โดยตรงโดยไม่มี context
+            fallback_prompt = f"""You are an expert on Phoenix Contact's PLCnext Technology platform.
+
+Please answer this question about PLCnext based on your knowledge:
+
+Question: {message}
+
+Provide a helpful and accurate answer. If you're not sure about specific details, say so."""
+
+            fallback_response = app.state.llm.invoke(fallback_prompt)
+            reply_text = fallback_response
+            logging.info(f"✅ Deep Mode: Fallback to LLM successful")
+        except Exception as e:
+            logging.error(f"🔥 Fallback error: {e}")
+            # Keep original response if fallback fails
     
     logging.info(f"📊 Deep Mode (RAG): Query length: {len(combined_message)} | Time: {total_time:.2f}s")
 
     response = {
-        "reply": result.get("llm_answer", "") or result.get("reply", ""),
+        "reply": reply_text,
         "processing_time": result.get("processing_time", total_time),
         "retrieval_time": result.get("retrieval_time", None),
         "context_count": result.get("context_count", None),
@@ -696,7 +747,7 @@ def get_stats(request: Request):
 @app.get("/")
 def root():
     return {
-        "message": "PLCnext Chatbot API v2.1",
+        "message": "PLCnext Chatbot API v2.2 (Fixed Auto Mode)",
         "endpoints": {
             "health": "/health",
             "chat": "/api/chat",
@@ -707,9 +758,9 @@ def root():
         },
         "supported_files": ["image/*", "audio/*", "pdf", "txt", "csv", "json", "docx"],
         "modes": {
-            "auto": "Automatically choose: large files → Fast, small files/no file → Deep",
+            "auto": "Smart selection: PLCnext questions → Deep, General questions → Fast, Large files → Fast",
             "fast": "Direct to LLM - Fast response (~5-10s), no database search",
-            "deep": "RAG mode - Slower (~30-60s) but uses database knowledge for detailed answers"
+            "deep": "RAG mode - Slower (~30-60s) but uses database knowledge (with fallback if no results)"
         }
     }
 
