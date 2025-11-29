@@ -21,24 +21,41 @@ def preprocess_query(query: str) -> str:
 
 
 def build_enhanced_prompt() -> PromptTemplate:
-    # ✅ FIXED: แก้ prompt ให้ fallback ได้เมื่อไม่เจอข้อมูลใน context
+    # ✅ VERSION 2.3: Prompt ที่ตอบละเอียดและครอบคลุมมากขึ้น
     template = """You are a specialized AI assistant for Phoenix Contact's PLCnext Technology platform.
 
-**CONTEXT:**
+**CONTEXT FROM DOCUMENTATION:**
 {context}
 
-**RESPONSE RULES:**
-1. **GOLDEN ANSWERS PRIORITY:** If context contains "Question:...Answer:" pairs, you MUST use them verbatim.
-2. **TECHNICAL PRECISION:** Include specific technical details, model numbers, and specifications when available.
-3. **STRUCTURED ANSWERS:** For technical questions, provide a direct answer first, followed by specifications if relevant.
-4. **PROTOCOL/MODE PRIORITY:** If the user question asks about 'protocol', 'communication mode', 'interface', or related topics, you must extract and clearly display protocol/mode information from the context.
-5. **CONTEXT FIRST:** Prioritize information from the provided context.
-6. **KNOWLEDGE FALLBACK:** If no relevant info is found in the context, answer based on your general knowledge about PLCnext Technology, Phoenix Contact products, and industrial automation. Make it clear when you're using general knowledge vs. specific documentation.
-7. **LANGUAGE:** Answer in the same language as the user's question. If the question is in Thai, answer in Thai. If in English, answer in English.
+**RESPONSE GUIDELINES:**
 
-**QUESTION:** {question}
+1. **COMPREHENSIVE ANSWERS:** Provide **detailed, thorough responses**. Do not give brief or superficial answers.
 
-**TECHNICAL ANSWER:**"""
+2. **STRUCTURE YOUR RESPONSE:** 
+   - Start with a clear summary/overview
+   - Break down into key points with explanations
+   - Include technical details, specifications, model numbers when available
+   - End with practical implications or next steps if relevant
+
+3. **GOLDEN ANSWERS:** If context contains "Question:...Answer:" pairs, prioritize that information.
+
+4. **USE ALL RELEVANT CONTEXT:** Extract and synthesize information from multiple parts of the context to provide complete answers.
+
+5. **LANGUAGE:** Answer in the **same language** as the user's question:
+   - If question is in Thai → Answer in Thai
+   - If question is in English → Answer in English
+
+6. **WHEN NO CONTEXT MATCHES:** If the context doesn't contain relevant information, provide a helpful answer based on your general knowledge about PLCnext, Phoenix Contact, or industrial automation. Clearly indicate when using general knowledge.
+
+7. **FOR DOCUMENT SUMMARIES:** When asked about uploaded files, provide:
+   - Main topic/purpose of the document
+   - Key findings or main points (at least 5-7 points)
+   - Technical details or specifications mentioned
+   - Conclusions or recommendations
+
+**USER'S QUESTION:** {question}
+
+**DETAILED TECHNICAL ANSWER:**"""
     return PromptTemplate(input_variables=["context", "question"], template=template)
 
 
@@ -53,9 +70,7 @@ def log_query_performance(query: str, response: str, retrieval_time: float, tota
         f"Total Time: {total_time:.2f}s"
     )
 
-# ============================================================
-# ฟังก์ชันเดิม (ไม่มี streaming) - ใช้สำหรับ /api/chat
-# ============================================================
+
 def answer_question(
     question: str,
     db_pool,
@@ -64,7 +79,7 @@ def answer_question(
     collection: str,
     retriever_class,
     reranker_class,
-    top_k: int = 4,
+    top_k: int = 6,  # ✅ เพิ่มจาก 4 เป็น 6 เพื่อให้มี context มากขึ้น
 ) -> dict:
     import time
 
@@ -96,11 +111,10 @@ def answer_question(
 
     prompt = build_enhanced_prompt()
     
-    # ✅ FIXED: ถ้าไม่มี context ให้บอก LLM ว่าให้ใช้ความรู้ทั่วไป
     if context_texts:
-        context_str = "\n".join(f"- {c}" for c in context_texts)
+        context_str = "\n\n".join(f"[Source {i+1}]\n{c}" for i, c in enumerate(context_texts))
     else:
-        context_str = "(No specific documentation found. Please answer based on your general knowledge about PLCnext Technology.)"
+        context_str = "(No specific documentation found. Please provide a helpful answer based on general knowledge about PLCnext Technology and industrial automation.)"
 
     rag_chain = (
         {"context": (lambda _: context_str), "question": RunnablePassthrough()}
@@ -123,9 +137,6 @@ def answer_question(
     }
 
 
-# ============================================================
-# ⚡ ฟังก์ชันใหม่ (Streaming) - ใช้สำหรับ /api/chat/stream
-# ============================================================
 def answer_question_stream(
     question: str,
     db_pool,
@@ -134,12 +145,9 @@ def answer_question_stream(
     collection: str,
     retriever_class,
     reranker_class,
-    top_k: int = 4,
+    top_k: int = 6,
 ) -> Generator[str, None, None]:
-    """
-    Streaming version ของ answer_question
-    ส่ง token ทีละตัวกลับไปทันทีที่ LLM generate ได้
-    """
+    """Streaming version ของ answer_question"""
     import time
     import json
 
@@ -150,7 +158,6 @@ def answer_question_stream(
 
     t0 = time.perf_counter()
 
-    # Step 1: Retrieval (ส่วนนี้ยังต้องรอ แต่ใช้เวลาแค่ 1-2 วินาที)
     base_retriever = retriever_class(
         connection_pool=db_pool,
         embedder=embedder,
@@ -165,23 +172,18 @@ def answer_question_stream(
     context_texts = [d.page_content for d in retrieved_docs][:top_k]
     context_count = len(context_texts)
     
-    # ✅ FIXED: ถ้าไม่มี context ให้บอก LLM ว่าให้ใช้ความรู้ทั่วไป
     if context_texts:
-        context_str = "\n".join(f"- {c}" for c in context_texts)
+        context_str = "\n\n".join(f"[Source {i+1}]\n{c}" for i, c in enumerate(context_texts))
     else:
-        context_str = "(No specific documentation found. Please answer based on your general knowledge about PLCnext Technology.)"
+        context_str = "(No specific documentation found. Please provide a helpful answer based on general knowledge about PLCnext Technology.)"
 
-    # ส่ง metadata ก่อน (retrieval เสร็จแล้ว)
     yield f"data: {json.dumps({'type': 'metadata', 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count})}\n\n"
 
-    # Step 2: Build prompt
     prompt = build_enhanced_prompt()
     formatted_prompt = prompt.format(context=context_str, question=processed_msg)
 
-    # Step 3: Stream from LLM
     full_response = ""
     try:
-        # ใช้ .stream() method ของ LangChain LLM
         for chunk in llm.stream(formatted_prompt):
             if chunk:
                 full_response += chunk
@@ -192,7 +194,6 @@ def answer_question_stream(
 
     total_time = time.perf_counter() - t0
 
-    # ส่ง final message
     yield f"data: {json.dumps({'type': 'done', 'processing_time': round(total_time, 2), 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count})}\n\n"
 
     log_query_performance(processed_msg, full_response, retrieval_time, total_time, context_count)

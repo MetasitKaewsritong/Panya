@@ -1,4 +1,9 @@
-// App.jsx - with Auto/Fast/Deep mode selector
+// App.jsx v2.3 - with Chat History Support
+// ✅ CHANGES:
+// 1. ส่ง chat history ไป backend
+// 2. แสดง mode ตามที่ user เลือก (auto/fast/deep)
+// 3. Deep mode แสดงเป็น "🔍 Deep" (ไม่ใช่ "Deep Think")
+
 import { useState, useEffect, useRef } from "react";
 import axios from "axios";
 import {
@@ -75,14 +80,14 @@ const FilePreviewIcon = ({ fileType, className }) => {
   }
 };
 
-// ⚡ Mode Selector Component - แสดงตลอดเวลา
+// ✅ UPDATED: Mode Selector Component
 const ModeSelector = ({ mode, setMode, disabled }) => {
   const [isOpen, setIsOpen] = useState(false);
   
   const modes = [
     { id: "auto", label: "Auto", icon: Brain, description: "เลือกอัตโนมัติตามสถานการณ์", color: "text-purple-600" },
-    { id: "fast", label: "Fast", icon: Zap, description: "เร็ว ~5-10 วินาที (ไม่ใช้ database)", color: "text-yellow-600" },
-    { id: "deep", label: "Deep", icon: Gauge, description: "ละเอียด ~30-60 วินาที (ใช้ RAG + database)", color: "text-blue-600" },
+    { id: "fast", label: "Fast", icon: Zap, description: "เร็ว ~5-10 วินาที", color: "text-yellow-600" },
+    { id: "deep", label: "Deep", icon: Gauge, description: "ละเอียด ~30-60 วินาที", color: "text-blue-600" },
   ];
   
   const currentMode = modes.find(m => m.id === mode) || modes[0];
@@ -108,7 +113,7 @@ const ModeSelector = ({ mode, setMode, disabled }) => {
           <div className="fixed inset-0 z-10" onClick={() => setIsOpen(false)} />
           <div className="absolute bottom-full left-0 mb-2 w-64 bg-white rounded-xl shadow-lg border border-gray-200 overflow-hidden z-20">
             <div className="p-2 border-b bg-gray-50">
-              <p className="text-xs text-gray-500 font-medium">เลือกโหมดการอ่านไฟล์</p>
+              <p className="text-xs text-gray-500 font-medium">เลือกโหมดการตอบ</p>
             </div>
             {modes.map((m) => {
               const Icon = m.icon;
@@ -201,8 +206,28 @@ const MessageContent = ({ text }) => {
   );
 };
 
+// ✅ UPDATED: Message component with proper mode display
 const Message = ({ text, sender, image, fileName, fileType, mode }) => {
   const isUser = sender === "user";
+  
+  // ✅ Helper function to get mode display
+  const getModeDisplay = (modeValue) => {
+    if (!modeValue) return null;
+    
+    switch(modeValue.toLowerCase()) {
+      case 'auto':
+        return { label: '🤖 Auto', bgClass: 'bg-purple-100 text-purple-700' };
+      case 'fast':
+        return { label: '⚡ Fast', bgClass: 'bg-yellow-100 text-yellow-700' };
+      case 'deep':
+        return { label: '🔍 Deep', bgClass: 'bg-blue-100 text-blue-700' };
+      default:
+        return { label: modeValue, bgClass: 'bg-gray-100 text-gray-700' };
+    }
+  };
+  
+  const modeDisplay = getModeDisplay(mode);
+  
   return (
     <div className={`flex items-start gap-3 ${isUser ? "justify-end" : ""} my-4`}>
       {!isUser && (
@@ -211,23 +236,15 @@ const Message = ({ text, sender, image, fileName, fileType, mode }) => {
         </div>
       )}
       <div className={`max-w-2xl px-5 py-3 rounded-xl shadow-sm break-words ${isUser ? "bg-blue-600 text-white" : "bg-white text-gray-800 border"}`}>
-        {/* ⚡ แสดง mode badge ถ้ามี */}
-        {mode && !isUser && (
+        {/* ✅ แสดง mode badge */}
+        {modeDisplay && !isUser && (
           <div className="flex items-center gap-1 mb-2">
-            <span className={`text-xs px-2 py-0.5 rounded-full ${
-              mode.includes('fast') ? 'bg-yellow-100 text-yellow-700' :
-              mode.includes('deep') ? 'bg-blue-100 text-blue-700' :
-              mode === 'rag' ? 'bg-green-100 text-green-700' :
-              'bg-purple-100 text-purple-700'
-            }`}>
-              {mode.includes('fast') ? '⚡ Fast' :
-               mode.includes('deep') ? '🔍 Deep' :
-               mode === 'rag' ? '📚 RAG' :
-               '🤖 ' + mode}
+            <span className={`text-xs px-2 py-0.5 rounded-full ${modeDisplay.bgClass}`}>
+              {modeDisplay.label}
             </span>
           </div>
         )}
-        {/* ⚡ แสดง preview ตามประเภทไฟล์ */}
+        {/* แสดง preview ตามประเภทไฟล์ */}
         {image && fileType === "image" && (
           <img src={image} alt="upload" className="mb-2 max-h-40 rounded border" />
         )}
@@ -363,14 +380,11 @@ function App() {
   const [previewUrl, setPreviewUrl] = useState(null);
   const [fileType, setFileType] = useState(null);
   
-  // ⚡ เพิ่ม state สำหรับ mode
   const [fileMode, setFileMode] = useState("auto");
   
-  // ⚡ เพิ่ม state สำหรับ upload progress
   const [uploadProgress, setUploadProgress] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
 
-  // voice modal state
   const [isVoiceModalOpen, setIsVoiceModalOpen] = useState(false);
 
   const chatEndRef = useRef(null);
@@ -378,7 +392,6 @@ function App() {
 
   const API_URL = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
-  // ⚡ รายการประเภทไฟล์ที่รองรับ
   const ACCEPTED_FILE_TYPES = [
     "image/*",
     "audio/*",
@@ -418,7 +431,6 @@ function App() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatHistory, activeChatId]);
 
-  // 1. Voice transcription
   const handleTranscriptionComplete = async (audioBlob) => {
     const formData = new FormData();
     formData.append('file', audioBlob, 'recording.webm');
@@ -434,7 +446,6 @@ function App() {
     }
   };
 
-  // 2. New Chat
   const handleNewChat = () => {
     const newChat = {
       id: Date.now().toString(),
@@ -452,16 +463,15 @@ function App() {
     setInput("");
   };
 
-  // 3. Select Chat
   const handleSelectChat = (chatId) => {
     setActiveChatId(chatId);
   };
 
-  // 4. Delete Chat
   const handleDeleteChat = (e, chatIdToDelete) => {
     e.stopPropagation();
     setConfirmDeleteId(chatIdToDelete);
   };
+  
   const confirmDeleteChat = () => {
     setChatHistory((prev) =>
       prev.filter((chat) => chat.id !== confirmDeleteId)
@@ -478,11 +488,11 @@ function App() {
     }
     setConfirmDeleteId(null);
   };
+  
   const cancelDeleteChat = () => {
     setConfirmDeleteId(null);
   };
 
-  // 5. File preview
   const handleFileSelect = (event) => {
     const file = event.target.files[0];
     if (!file) return;
@@ -506,7 +516,7 @@ function App() {
     setFileType(null);
   };
 
-  // 6. Send Message - ⚡ เพิ่ม mode parameter และ upload progress
+  // ✅ UPDATED: Send Message with chat history
   const handleSendMessage = async (e) => {
     e.preventDefault();
     const userText = input.trim();
@@ -522,7 +532,11 @@ function App() {
     setInput("");
     setIsLoading(true);
 
-    // push user message ก่อน
+    // Get current chat's messages for history
+    const activeChat = chatHistory.find(chat => chat.id === activeChatId);
+    const currentMessages = activeChat ? activeChat.messages : [];
+
+    // Push user message
     setChatHistory((prev) => {
       const newHistory = [...prev];
       const activeChatIndex = newHistory.findIndex(
@@ -544,12 +558,19 @@ function App() {
     try {
       const formData = new FormData();
       formData.append("message", userText);
-      formData.append("mode", fileMode);  // ⚡ ส่ง mode ไปด้วย
+      formData.append("mode", fileMode);
+      
+      // ✅ NEW: ส่ง chat history ไป backend
+      const historyForBackend = currentMessages.map(msg => ({
+        text: msg.text,
+        sender: msg.sender
+      }));
+      formData.append("chat_history", JSON.stringify(historyForBackend));
+      
       if (selectedFile) {
         formData.append("file", selectedFile);
       }
       
-      // ⚡ ใช้ axios พร้อม onUploadProgress
       const response = await axios.post(
         `${API_URL}/api/agent-chat`,
         formData,
@@ -567,17 +588,10 @@ function App() {
         }
       );
 
-      const botText =
-        typeof response.data?.reply === "string"
-          ? response.data.reply
-          : typeof response.data?.answer === "string"
-          ? response.data.answer
-          : "";
-
       const botMessage = { 
         text: (response.data.reply ?? response.data.answer ?? ""), 
         sender: "bot",
-        mode: response.data.mode || null  // ⚡ เก็บ mode ที่ใช้
+        mode: response.data.mode || null
       };
 
       setChatHistory((prev) => {
@@ -694,7 +708,8 @@ function App() {
               </div>
             ))}
           </div>
-          {/* --- Pop up ยืนยันการลบแชท --- */}
+          
+          {/* Delete Confirmation Modal */}
           {confirmDeleteId && (
             <div className="fixed inset-0 z-40 bg-black bg-opacity-40 flex items-center justify-center">
               <div className="bg-white rounded-lg shadow-xl p-6 w-80 flex flex-col items-center">
@@ -719,6 +734,7 @@ function App() {
             </div>
           )}
         </aside>
+        
         {/* Main Content */}
         <div className="flex-1 flex flex-col bg-gray-100">
           <header className="flex items-center p-2 bg-white border-b border-gray-200 shadow-sm">
@@ -763,12 +779,13 @@ function App() {
               <div ref={chatEndRef} />
             </div>
           </main>
+          
           {/* Footer/INPUT bar */}
           <footer className="p-4 bg-gray-100/80 backdrop-blur-sm">
             <div className="max-w-4xl mx-auto">
-              <div className={`bg-white border border-gray-300 shadow-sm focus-within:ring-2 focus-within:ring-blue-400 ${(previewUrl || selectedFile) ? 'rounded-2xl' : 'rounded-2xl'}`}>
+              <div className={`bg-white border border-gray-300 shadow-sm focus-within:ring-2 focus-within:ring-blue-400 rounded-2xl`}>
                 <form onSubmit={handleSendMessage} className="p-2">
-                  {/* ⚡ Preview ที่รองรับหลายประเภท + Progress Bar */}
+                  {/* Preview + Progress Bar */}
                   {selectedFile && (
                     <div className="relative m-2 p-2 border rounded-lg bg-gray-50 inline-flex items-center gap-2">
                       {fileType === "image" && previewUrl ? (
@@ -784,7 +801,6 @@ function App() {
                           </div>
                         </div>
                       )}
-                      {/* ⚡ Progress Bar */}
                       {isUploading && (
                         <div className="absolute bottom-0 left-0 right-0 h-1 bg-gray-200 rounded-b-lg overflow-hidden">
                           <div 
@@ -814,7 +830,7 @@ function App() {
                       className="hidden" 
                       accept={ACCEPTED_FILE_TYPES} 
                     />
-                    {/* ⚡ Mode Selector - แสดงตลอดเวลา */}
+                    {/* Mode Selector */}
                     <ModeSelector mode={fileMode} setMode={setFileMode} disabled={isLoading} />
                     <button type="button" onClick={() => fileInputRef.current.click()} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-gray-100 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed" aria-label="Attach file" disabled={isLoading}><Paperclip size={20} /></button>
                     <button type="button" onClick={() => setIsVoiceModalOpen(true)} className="p-2 text-gray-500 hover:text-blue-600 hover:bg-gray-100 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed" aria-label="Use microphone" disabled={isLoading}><Mic size={20} /></button>
@@ -832,7 +848,6 @@ function App() {
                   </div>
                 </form>
               </div>
-              {/* ⚡ แสดงประเภทไฟล์ที่รองรับ */}
               <p className="text-xs text-gray-400 text-center mt-2">
                 Supported: Images, Audio, PDF, TXT, CSV, JSON, DOC/DOCX
               </p>
