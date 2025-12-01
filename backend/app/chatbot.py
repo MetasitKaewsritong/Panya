@@ -1,21 +1,145 @@
 # backend/app/chatbot.py
-# ✅ VERSION 2.5 - Enhanced PLCnext Expert Prompt
-# - Chain-of-Thought reasoning
-# - PLCnext expertise
-# - Better Thai/English support
-# - More abbreviations
+# ✅ VERSION 2.7 - Dynamic Cutoff + Anti-Hallucination
+# 
+# Changes from v2.6:
+# - Dynamic Score Cutoff (ไม่ใช่ fixed threshold)
+# - Normalize score เป็น 0-1
+# - MIN_KEEP logic (เก็บ top-2 เสมอ)
+# - HARD_MIN / SOFT_MIN safety
+# - Anti-hallucination prompt ที่เข้มงวด
+# - ลบ DuckDuckGo fallback
+# - Optimized สำหรับ Llama 3.2
 
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-from typing import Generator
+from typing import Generator, List, Optional
+import math
+import logging
 
+# ============================================================
+# CONFIGURATION - ปรับค่าได้ตามต้องการ
+# ============================================================
+
+FINAL_K = 3        # จำนวน doc สุดท้ายที่ส่งเข้า LLM
+MIN_KEEP = 2       # เก็บ top-N เสมอ (ไม่สน cutoff)
+ALPHA = 0.6        # สัดส่วนของ max_score สำหรับ cutoff
+HARD_MIN = 0.10    # max_score ต่ำกว่านี้ = no-doc
+SOFT_MIN = 0.15    # cutoff ขั้นต่ำทั่วไป
+MAX_CANDIDATES = 5 # พิจารณาแค่ N ตัวแรกจาก reranker
+
+
+# ============================================================
+# SCORE UTILITIES
+# ============================================================
+
+def normalize_score(raw_score: float) -> float:
+    """
+    Normalize score ให้อยู่ในช่วง 0-1
+    ใช้ sigmoid สำหรับ score ที่อาจเป็นค่าลบหรือ > 1
+    """
+    if raw_score is None:
+        return 0.0
+    
+    # ถ้า score อยู่ในช่วง 0-1 อยู่แล้ว ไม่ต้อง normalize
+    if 0 <= raw_score <= 1:
+        return raw_score
+    
+    # ใช้ sigmoid สำหรับ score นอกช่วง (เช่น CrossEncoder -10 to +10)
+    return 1 / (1 + math.exp(-raw_score))
+
+
+def get_doc_score(doc) -> Optional[float]:
+    """
+    ดึง score จาก document object
+    รองรับหลาย format: .score, .metadata["score"], etc.
+    """
+    # Try direct attribute
+    score = getattr(doc, "score", None)
+    if score is not None:
+        return normalize_score(score)
+    
+    # Try metadata dict
+    metadata = getattr(doc, "metadata", {})
+    if isinstance(metadata, dict):
+        score = metadata.get("score") or metadata.get("relevance_score")
+        if score is not None:
+            return normalize_score(score)
+    
+    return None
+
+
+# ============================================================
+# CONTEXT SELECTION (Dynamic Cutoff)
+# ============================================================
+
+def select_context_docs(retrieved_docs: List, max_candidates: int = MAX_CANDIDATES) -> List:
+    """
+    เลือกเอกสารที่ดีที่สุดแบบ Dynamic Cutoff + Safety
+    
+    Logic:
+    1. ถ้าไม่มี doc → return []
+    2. ถ้า max_score < HARD_MIN → return [] (ไม่มี doc ที่ดีเลย)
+    3. คำนวณ cutoff = max(max_score * ALPHA, SOFT_MIN)
+    4. เก็บ doc ตามเงื่อนไข:
+       - index < MIN_KEEP → เก็บเสมอ
+       - index >= MIN_KEEP → เก็บถ้า score >= cutoff
+    5. หยุดเมื่อครบ FINAL_K
+    
+    Returns:
+        List of selected documents (อาจว่างได้)
+    """
+    candidates = (retrieved_docs or [])[:max_candidates]
+    
+    if not candidates:
+        logging.info("📭 No candidates from retriever")
+        return []
+    
+    # Get max score
+    max_score = get_doc_score(candidates[0])
+    
+    if max_score is None:
+        # Reranker ไม่มี score → ใช้ top_k ตรงๆ
+        logging.warning("⚠️ Reranker has no score - using top_k directly")
+        return candidates[:FINAL_K]
+    
+    logging.info(f"📊 Max score: {max_score:.3f}")
+    
+    # Hard no-doc: score ต่ำมากทั้งก้อน
+    if max_score < HARD_MIN:
+        logging.info(f"❌ Max score {max_score:.3f} < HARD_MIN {HARD_MIN} → no-doc")
+        return []
+    
+    # Calculate dynamic cutoff
+    base_cutoff = max_score * ALPHA
+    cutoff = max(base_cutoff, SOFT_MIN)
+    logging.info(f"📐 Cutoff: {cutoff:.3f} (base={base_cutoff:.3f}, soft_min={SOFT_MIN})")
+    
+    # Select docs
+    final_docs = []
+    for i, doc in enumerate(candidates):
+        score = get_doc_score(doc) or max_score  # fallback
+        
+        # เก็บ top-N เสมอ หรือ score >= cutoff
+        if i < MIN_KEEP or score >= cutoff:
+            final_docs.append(doc)
+            logging.debug(f"  ✓ Doc[{i}] score={score:.3f} - KEPT")
+        else:
+            logging.debug(f"  ✗ Doc[{i}] score={score:.3f} - REJECTED")
+        
+        if len(final_docs) >= FINAL_K:
+            break
+    
+    logging.info(f"📚 Selected {len(final_docs)} docs from {len(candidates)} candidates")
+    return final_docs
+
+
+# ============================================================
+# QUERY PREPROCESSING
+# ============================================================
 
 def preprocess_query(query: str) -> str:
-    """
-    แปลงคำย่อเป็นคำเต็มเพื่อช่วยในการค้นหา
-    เพิ่มคำย่อ PLCnext ที่ใช้บ่อย
-    """
+    """แปลงคำย่อเป็นคำเต็มเพื่อช่วยในการค้นหา"""
     abbreviations = {
         # PLCnext Controllers
         "axc": "AXC PLCnext Controller",
@@ -60,8 +184,6 @@ def preprocess_query(query: str) -> str:
     
     import re
     processed_query = query.lower()
-    
-    # Sort by length (longest first) to avoid partial matches
     sorted_abbrs = sorted(abbreviations.items(), key=lambda x: len(x[0]), reverse=True)
     
     for abbr, full_form in sorted_abbrs:
@@ -71,98 +193,105 @@ def preprocess_query(query: str) -> str:
     return processed_query if processed_query != query.lower() else query
 
 
+# ============================================================
+# PROMPTS
+# ============================================================
+
 def build_enhanced_prompt() -> PromptTemplate:
     """
-    ✅ VERSION 2.5: PLCnext Expert Prompt with Chain-of-Thought
+    ✅ VERSION 2.7: Anti-Hallucination Prompt for Llama 3.2
+    - สั้นกว่าเดิม (Llama ทำงานดีกับ prompt สั้น)
+    - เข้มงวดเรื่อง "ตอบจาก context เท่านั้น"
+    - บังคับปฏิเสธถ้าไม่มีข้อมูล
     """
-    template = """คุณคือผู้เชี่ยวชาญด้าน PLCnext Technology จาก Phoenix Contact 
-You are an expert AI assistant specializing in Phoenix Contact's PLCnext Technology platform.
+    template = """You are Panya, a PLCnext expert. Answer ONLY from the documents below.
 
-## 🧠 YOUR EXPERTISE:
-- PLCnext Controllers (AXC F 1152, AXC F 2152, AXC F 3152, RFC 4072S, ELC)
-- Axioline I/O Systems (AXL F, AXL SE)
-- Communication Protocols (PROFINET, OPC UA, Modbus, MQTT)
-- PLCnext Engineer IDE and programming (IEC 61131-3, C++, C#, Python)
-- Global Data Space (GDS), ESM, Real-time Linux
-- Industrial automation and control systems
-
-## 📚 CONTEXT FROM PLCNEXT DOCUMENTATION:
+## DOCUMENTS:
 {context}
 
-## 🎯 RESPONSE RULES:
+## RULES:
+1. ONLY use information from documents above
+2. If documents don't contain the answer → say "ไม่พบข้อมูล"
+3. NEVER invent product names or specifications
+4. If asked for specific info not in documents → admit you don't know
+5. Answer in same language as question (Thai→Thai, English→English)
 
-### STEP 1: UNDERSTAND THE QUESTION
-- What is the user asking about?
-- Is it about hardware, software, programming, or configuration?
-- What specific PLCnext product or feature is involved?
+## QUESTION: {question}
 
-### STEP 2: FIND RELEVANT INFORMATION
-- Search the context for relevant information
-- Identify specific model numbers, specifications, or procedures
-- Note any important warnings or requirements
-
-### STEP 3: PROVIDE STRUCTURED ANSWER
-**Format your response as follows:**
-
-📌 **สรุป/Summary:** (1-2 sentences answering the core question)
-
-📋 **รายละเอียด/Details:**
-- Provide step-by-step explanation if it's a procedure
-- Include technical specifications if asking about hardware
-- Mention compatibility or requirements if relevant
-
-💡 **เคล็ดลับ/Tips:** (Optional - add practical advice if helpful)
-
-⚠️ **ข้อควรระวัง/Warnings:** (Optional - add if there are important cautions)
-
-### STEP 4: LANGUAGE
-- ถ้าคำถามเป็นภาษาไทย → ตอบเป็นภาษาไทย
-- If question is in English → Answer in English
-- Use technical terms in English (e.g., "PROFINET", "GDS", "OPC UA")
-
-### STEP 5: IF NO CONTEXT MATCHES
-- Use your general knowledge about PLCnext Technology
-- Clearly state: "จากความรู้ทั่วไป..." or "Based on general knowledge..."
-- Still provide helpful, accurate information
-
-## ❓ USER'S QUESTION: 
-{question}
-
-## ✅ YOUR EXPERT ANSWER:
-"""
+## ANSWER:"""
     return PromptTemplate(input_variables=["context", "question"], template=template)
+
+
+def build_no_context_prompt() -> PromptTemplate:
+    """
+    Prompt สำหรับกรณีไม่มี context ที่เกี่ยวข้อง
+    บังคับให้ LLM ปฏิเสธตอบ
+    """
+    template = """You are Panya, a PLCnext assistant.
+
+The knowledge base was searched but NO relevant documents were found for this question.
+
+You MUST respond with this exact format:
+
+❌ **ขออภัย:** ไม่พบข้อมูลที่ตรงกับคำถามนี้ในฐานความรู้
+
+💡 **สิ่งที่ค้นหาได้ในระบบ:**
+- PLCnext Controllers (AXC F 1152, AXC F 2152, AXC F 3152)
+- Axioline I/O modules
+- PLCnext Engineer programming
+- Communication protocols (PROFINET, OPC UA, Modbus)
+
+DO NOT make up any information. DO NOT guess.
+
+## QUESTION: {question}
+
+## YOUR RESPONSE:"""
+    return PromptTemplate(input_variables=["question"], template=template)
 
 
 def build_fast_prompt() -> PromptTemplate:
     """
-    Prompt สำหรับ Fast Mode (ไม่มี context) - ตอบเร็ว กระชับ
+    Fast Mode - ตอบคำถามทั่วไป ห้ามระบุ PLCnext spec เฉพาะ
     """
-    template = """You are a helpful AI assistant with expertise in PLCnext Technology from Phoenix Contact.
+    template = """You are Panya, a helpful AI assistant.
 
-Answer the following question helpfully and accurately.
-If it's about PLCnext, use your knowledge about industrial automation and PLC systems.
+## RULES:
+✅ CAN answer: greetings, general questions, basic concepts
+❌ CANNOT answer (say "กรุณาใช้โหมด Deep"): 
+   - Specific PLCnext product specs
+   - Model comparisons
+   - Installation procedures
+   - Error troubleshooting
 
-**LANGUAGE RULE:**
-- ถ้าคำถามเป็นภาษาไทย → ตอบเป็นภาษาไทย
-- If question is in English → Answer in English
+## LANGUAGE: Answer in same language as question
 
-**Question:** {question}
+## QUESTION: {question}
 
-**Your helpful answer:**"""
+## ANSWER:"""
     return PromptTemplate(input_variables=["question"], template=template)
 
 
-def log_query_performance(query: str, response: str, retrieval_time: float, total_time: float, context_count: int):
-    import logging
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log_query_performance(query: str, response: str, retrieval_time: float, 
+                          total_time: float, context_count: int, max_score: float = None):
+    # Format max_score safely
+    score_str = f"{max_score:.3f}" if max_score is not None else "N/A"
+    
     logging.info(
-        f"📊 Query Performance: "
-        f"Query: '{query[:50]}...' | "
-        f"Response Length: {len(response)} chars | "
-        f"Context Count: {context_count} | "
+        f"📊 Query: '{query[:50]}...' | "
+        f"Contexts: {context_count} | "
+        f"MaxScore: {score_str} | "
         f"Retrieval: {retrieval_time:.2f}s | "
         f"Total: {total_time:.2f}s"
     )
 
+
+# ============================================================
+# MAIN RAG FUNCTION
+# ============================================================
 
 def answer_question(
     question: str,
@@ -172,10 +301,19 @@ def answer_question(
     collection: str,
     retriever_class,
     reranker_class,
-    top_k: int = 8,  # ✅ เพิ่มเป็น 8 เพื่อให้มี context มากขึ้น
+    top_k: int = 8,  # initial retrieval (จะถูก filter โดย select_context_docs)
 ) -> dict:
     """
-    ตอบคำถามโดยใช้ RAG Pipeline
+    ✅ VERSION 2.7: RAG Pipeline with Dynamic Cutoff
+    
+    Flow:
+    1. Preprocess query (expand abbreviations)
+    2. Retrieve documents (top_k)
+    3. Rerank documents
+    4. Select best docs with Dynamic Cutoff
+    5. If no good docs → use no_context_prompt (force rejection)
+    6. If has good docs → use enhanced_prompt
+    7. Return response
     """
     import time
 
@@ -186,12 +324,13 @@ def answer_question(
             "processing_time": 0.0,
             "retrieval_time": 0.0,
             "context_count": 0,
-            "contexts": []
+            "contexts": [],
+            "max_score": None
         }
 
     t0 = time.perf_counter()
 
-    # Retrieve documents
+    # Retrieve & Rerank
     base_retriever = retriever_class(
         connection_pool=db_pool,
         embedder=embedder,
@@ -203,45 +342,57 @@ def answer_question(
     retrieved_docs = reranker_retriever.invoke(processed_msg) or []
     retrieval_time = time.perf_counter() - t_retr_start
 
-    # Build context
-    context_texts = [d.page_content for d in retrieved_docs][:top_k]
+    # ✅ Dynamic Cutoff Selection
+    selected_docs = select_context_docs(retrieved_docs)
+    context_texts = [d.page_content for d in selected_docs]
     context_count = len(context_texts)
-
-    prompt = build_enhanced_prompt()
     
+    # Get max score for logging
+    max_score = get_doc_score(retrieved_docs[0]) if retrieved_docs else None
+
+    # Build prompt based on context availability
     if context_texts:
+        # มี context ที่ดี → ใช้ enhanced prompt
+        prompt = build_enhanced_prompt()
         context_str = "\n\n---\n\n".join(
-            f"📄 [Document {i+1}]\n{c}" 
+            f"[Doc {i+1}]\n{c}" 
             for i, c in enumerate(context_texts)
         )
+        rag_chain = (
+            {"context": (lambda _: context_str), "question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
     else:
-        context_str = """⚠️ ไม่พบเอกสารที่เกี่ยวข้องใน database
-(No relevant documents found in the database)
-
-กรุณาตอบจากความรู้ทั่วไปเกี่ยวกับ PLCnext Technology
-Please answer based on general knowledge about PLCnext Technology."""
-
-    # Run RAG chain
-    rag_chain = (
-        {"context": (lambda _: context_str), "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+        # ไม่มี context ที่ดี → บังคับ rejection
+        prompt = build_no_context_prompt()
+        rag_chain = (
+            {"question": RunnablePassthrough()}
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
 
     response_text = rag_chain.invoke(processed_msg)
     total_time = time.perf_counter() - t0
 
-    log_query_performance(processed_msg, response_text, retrieval_time, total_time, context_count)
+    log_query_performance(processed_msg, response_text, retrieval_time, 
+                          total_time, context_count, max_score)
 
     return {
         "reply": response_text,
         "processing_time": total_time,
         "retrieval_time": retrieval_time,
         "context_count": context_count,
-        "contexts": context_texts
+        "contexts": context_texts,
+        "max_score": max_score
     }
 
+
+# ============================================================
+# STREAMING VERSION
+# ============================================================
 
 def answer_question_stream(
     question: str,
@@ -253,21 +404,18 @@ def answer_question_stream(
     reranker_class,
     top_k: int = 8,
 ) -> Generator[str, None, None]:
-    """
-    Streaming version ของ answer_question
-    ส่ง token ทีละตัวกลับไปทันทีที่ LLM generate ได้
-    """
+    """✅ VERSION 2.7: Streaming with Dynamic Cutoff"""
     import time
     import json
 
     processed_msg = preprocess_query((question or "").strip())
     if not processed_msg:
-        yield f"data: {json.dumps({'token': 'กรุณาพิมพ์คำถาม', 'done': True})}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'error': 'กรุณาพิมพ์คำถาม'})}\n\n"
         return
 
     t0 = time.perf_counter()
 
-    # Retrieve documents
+    # Retrieve & Rerank
     base_retriever = retriever_class(
         connection_pool=db_pool,
         embedder=embedder,
@@ -279,26 +427,28 @@ def answer_question_stream(
     retrieved_docs = reranker_retriever.invoke(processed_msg) or []
     retrieval_time = time.perf_counter() - t_retr_start
 
-    # Build context
-    context_texts = [d.page_content for d in retrieved_docs][:top_k]
+    # ✅ Dynamic Cutoff Selection
+    selected_docs = select_context_docs(retrieved_docs)
+    context_texts = [d.page_content for d in selected_docs]
     context_count = len(context_texts)
-    
-    if context_texts:
-        context_str = "\n\n---\n\n".join(
-            f"📄 [Document {i+1}]\n{c}" 
-            for i, c in enumerate(context_texts)
-        )
-    else:
-        context_str = """⚠️ ไม่พบเอกสารที่เกี่ยวข้องใน database
-กรุณาตอบจากความรู้ทั่วไปเกี่ยวกับ PLCnext Technology"""
+    max_score = get_doc_score(retrieved_docs[0]) if retrieved_docs else None
 
     # Send metadata
-    yield f"data: {json.dumps({'type': 'metadata', 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count})}\n\n"
+    yield f"data: {json.dumps({'type': 'metadata', 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count, 'max_score': round(max_score, 3) if max_score else None})}\n\n"
 
-    # Generate response
-    prompt = build_enhanced_prompt()
-    formatted_prompt = prompt.format(context=context_str, question=processed_msg)
+    # Build prompt
+    if context_texts:
+        prompt = build_enhanced_prompt()
+        context_str = "\n\n---\n\n".join(
+            f"[Doc {i+1}]\n{c}" 
+            for i, c in enumerate(context_texts)
+        )
+        formatted_prompt = prompt.format(context=context_str, question=processed_msg)
+    else:
+        prompt = build_no_context_prompt()
+        formatted_prompt = prompt.format(question=processed_msg)
 
+    # Stream response
     full_response = ""
     try:
         for chunk in llm.stream(formatted_prompt):
@@ -306,12 +456,12 @@ def answer_question_stream(
                 full_response += chunk
                 yield f"data: {json.dumps({'type': 'token', 'token': chunk})}\n\n"
     except Exception as e:
+        logging.error(f"❌ Streaming error: {e}")
         yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
         return
 
     total_time = time.perf_counter() - t0
+    yield f"data: {json.dumps({'type': 'done', 'processing_time': round(total_time, 2)})}\n\n"
 
-    # Send completion
-    yield f"data: {json.dumps({'type': 'done', 'processing_time': round(total_time, 2), 'retrieval_time': round(retrieval_time, 2), 'context_count': context_count})}\n\n"
-
-    log_query_performance(processed_msg, full_response, retrieval_time, total_time, context_count)
+    log_query_performance(processed_msg, full_response, retrieval_time, 
+                          total_time, context_count, max_score)
