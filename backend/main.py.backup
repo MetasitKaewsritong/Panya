@@ -328,7 +328,7 @@ def ask_llm_directly(llm, question: str, file_content: str = "", filename: str =
 """
     
     # ✅ UPDATED: Prompt ที่ตอบได้ทุกเรื่อง
-    prompt = f"""You are Panya, a helpful AI assistant. IMPORTANT: PLCnext is made by Phoenix Contact (NOT Siemens, NOT Schneider Electric!).
+    prompt = f"""You are a helpful AI assistant that can answer questions on ANY topic.
 You are knowledgeable, friendly, and provide comprehensive answers.
 
 {"=== CONVERSATION HISTORY ===" + chr(10) + history_str + "===" if history_str else ""}
@@ -346,7 +346,7 @@ You are knowledgeable, friendly, and provide comprehensive answers.
 4. If there are web search results, use them to provide accurate information
 5. Answer in the SAME LANGUAGE as the user's question (Thai/English)
 6. Be detailed and informative - don't give short, unhelpful answers
-7. If asked about PLCnext/PLC details, say "กรุณาใช้โหมด 🔍 Deep เพื่อค้นหาข้อมูลที่ถูกต้อง / Please use 🔍 Deep mode for accurate PLCnext information". NEVER say PLCnext is made by Siemens or Schneider!
+7. You can discuss ANY topic - technology, science, entertainment, business, etc.
 
 **Your comprehensive answer:**"""
 

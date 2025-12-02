@@ -7,7 +7,7 @@ from typing import List
 from sentence_transformers import SentenceTransformer
 from langchain_docling import DoclingLoader
 from langchain_core.documents import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import psycopg2
 
 
