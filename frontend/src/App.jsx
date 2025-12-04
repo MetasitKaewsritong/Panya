@@ -86,8 +86,8 @@ const ModeSelector = ({ mode, setMode, disabled }) => {
   
   const modes = [
     { id: "auto", label: "Auto", icon: Brain, description: "เลือกอัตโนมัติตามสถานการณ์", color: "text-purple-600" },
-    { id: "fast", label: "Fast", icon: Zap, description: "เร็ว ~5-10 วินาที", color: "text-yellow-600" },
-    { id: "deep", label: "Deep", icon: Gauge, description: "ละเอียด ~30-60 วินาที", color: "text-blue-600" },
+    { id: "fast", label: "Fast", icon: Zap, description: "", color: "text-yellow-600" },
+    { id: "deep", label: "Deep", icon: Gauge, description: "", color: "text-blue-600" },
   ];
   
   const currentMode = modes.find(m => m.id === mode) || modes[0];
