@@ -1,10 +1,7 @@
 # backend/main.py
-# ✅ VERSION 2.4 - แก้ไข:
-# 1. ตอบได้ทุกเรื่อง ไม่ใช่แค่ PLCnext
-# 2. Web search ที่ใช้งานได้จริง (ใช้ DuckDuckGo HTML search)
-# 3. Auto mode แสดงเป็น "auto"
-# 4. Deep mode ตอบละเอียด
-# 5. Chat history support
+# ✅ VERSION 2.5 - ENGLISH ONLY OUTPUT
+# Changes from 2.4:
+# - ask_llm_directly now enforces English-only responses
 
 import os
 import logging
@@ -285,12 +282,13 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
         return f"[Error reading file: {str(e)}]"
 
 
-# ✅ UPDATED: ถาม LLM โดยตรง - ตอบได้ทุกเรื่อง
+# ✅ UPDATED v2.5: ถาม LLM โดยตรง - ENGLISH ONLY
 def ask_llm_directly(llm, question: str, file_content: str = "", filename: str = "", 
                      mode: str = "auto", chat_history: List[dict] = None,
                      web_context: str = "") -> dict:
     """
     ส่งคำถามไป LLM โดยตรง - ตอบได้ทุกเรื่อง ไม่จำกัดแค่ PLCnext
+    ENGLISH ONLY OUTPUT
     """
     start_time = time.perf_counter()
     
@@ -299,7 +297,7 @@ def ask_llm_directly(llm, question: str, file_content: str = "", filename: str =
     if chat_history:
         for msg in chat_history[-10:]:
             role = "User" if msg.get("sender") == "user" else "Assistant"
-            text = msg.get("text", "")[:500]  # จำกัดความยาว
+            text = msg.get("text", "")[:500]
             history_str += f"{role}: {text}\n"
     
     # Handle file content
@@ -327,9 +325,12 @@ def ask_llm_directly(llm, question: str, file_content: str = "", filename: str =
 ===
 """
     
-    # ✅ UPDATED: Prompt ที่ตอบได้ทุกเรื่อง
-    prompt = f"""You are Panya, a helpful AI assistant. IMPORTANT: PLCnext is made by Phoenix Contact (NOT Siemens, NOT Schneider Electric!).
-You are knowledgeable, friendly, and provide comprehensive answers.
+    # ✅ ENGLISH ONLY PROMPT
+    prompt = f"""You are Panya, a helpful AI assistant.
+
+LANGUAGE RULE: You must ALWAYS answer in English only. Even if the user asks in Thai, Chinese, Japanese, German, or any other language, you must respond in English. Never respond in any language other than English.
+
+IMPORTANT: PLCnext is made by Phoenix Contact (NOT Siemens, NOT Schneider Electric!).
 
 {"=== CONVERSATION HISTORY ===" + chr(10) + history_str + "===" if history_str else ""}
 
@@ -340,15 +341,14 @@ You are knowledgeable, friendly, and provide comprehensive answers.
 **User's Question:** {question}
 
 **Instructions:**
-1. Answer the question thoroughly and helpfully
+1. Answer the question thoroughly and helpfully IN ENGLISH
 2. If there is conversation history, use it to maintain context
 3. If there is file content, analyze and reference it
 4. If there are web search results, use them to provide accurate information
-5. Answer in the SAME LANGUAGE as the user's question (Thai/English)
-6. Be detailed and informative - don't give short, unhelpful answers
-7. If asked about PLCnext/PLC details, say "กรุณาใช้โหมด 🔍 Deep เพื่อค้นหาข้อมูลที่ถูกต้อง / Please use 🔍 Deep mode for accurate PLCnext information". NEVER say PLCnext is made by Siemens or Schneider!
+5. Be detailed and informative - don't give short, unhelpful answers
+6. If asked about PLCnext/PLC details, say "Please use Deep mode for accurate PLCnext information"
 
-**Your comprehensive answer:**"""
+**Your answer in English:**"""
 
     try:
         response = llm.invoke(prompt)
@@ -399,7 +399,7 @@ async def lifespan(app: FastAPI):
             app.state.llm = OllamaLLM(
                 model=OLLAMA_MODEL,
                 base_url=OLLAMA_BASE_URL,
-                temperature=0.7,  # เพิ่มความคิดสร้างสรรค์
+                temperature=0.7,
                 timeout=180
             )
             logging.info(f"✅ LLM ({OLLAMA_MODEL}) loaded.")
@@ -425,9 +425,9 @@ async def lifespan(app: FastAPI):
 # ---- App init ----
 app = FastAPI(
     lifespan=lifespan,
-    title="PLCnext Chatbot v2.4",
-    description="General AI Assistant with RAG for PLCnext + Web Search",
-    version="2.4.0"
+    title="PLCnext Chatbot v2.5",
+    description="General AI Assistant with RAG for PLCnext + Web Search (English Only)",
+    version="2.5.0"
 )
 
 app.add_middleware(
@@ -557,7 +557,7 @@ def chat_stream_get(message: str, collection: str = "plcnext", request: Request 
     )
 
 
-# ✅ UPDATED: agent-chat v2.4 - ตอบได้ทุกเรื่อง + web search
+# ✅ agent-chat v2.5 - ENGLISH ONLY
 @app.post("/api/agent-chat")
 def agent_chat(
     message: str = Form(""),
@@ -619,7 +619,7 @@ def agent_chat(
     logging.info(f"🎯 Mode: {display_mode} (internal: {internal_mode})")
     
     # ====================================
-    # 🚀 FAST MODE - ตอบได้ทุกเรื่อง
+    # 🚀 FAST MODE - ENGLISH ONLY
     # ====================================
     if internal_mode == "fast":
         # ลอง search เว็บก่อนถ้าไม่ใช่คำถามทั่วไป
@@ -633,12 +633,10 @@ def agent_chat(
             "amazon" in message.lower(),
             "microsoft" in message.lower(),
             "apple" in message.lower(),
-            "ข้อมูล" in message.lower(),
-            "บริษัท" in message.lower(),
-            "โครงสร้าง" in message.lower(),
-            "ราคา" in message.lower(),
-            "ข่าว" in message.lower(),
-            "ล่าสุด" in message.lower(),
+            "company" in message.lower(),
+            "price" in message.lower(),
+            "news" in message.lower(),
+            "latest" in message.lower(),
             "2024" in message.lower(),
             "2025" in message.lower(),
         ])
@@ -693,7 +691,7 @@ def agent_chat(
             role = "User" if msg.get("sender") == "user" else "Assistant"
             history_context += f"{role}: {msg.get('text', '')[:200]}\n"
     
-    # ✅ FIX v2.7: แยก retrieval query กับ LLM context
+    # แยก retrieval query กับ LLM context
     retrieval_query = message
     llm_context = message
     if history_context:
@@ -705,7 +703,7 @@ def agent_chat(
         llm_context = f"{llm_context}\n\n--- File Content ({file.filename}) ---\n{truncated_file_text}"
 
     result = answer_question(
-        question=retrieval_query,  # ✅ ใช้แค่คำถาม ไม่รวม history
+        question=retrieval_query,
         db_pool=app.state.db_pool,
         llm=app.state.llm,
         embedder=app.state.embedder,
@@ -804,13 +802,13 @@ def get_stats(request: Request):
 @app.get("/")
 def root():
     return {
-        "message": "PLCnext Chatbot API v2.4 - General AI Assistant",
+        "message": "PLCnext Chatbot API v2.5 - English Only Output",
         "features": [
             "Answer ANY topic (not just PLCnext)",
             "Chat History Support",
             "Web Search for current information", 
             "RAG for PLCnext documentation",
-            "Multi-language support (Thai/English)"
+            "English-only output"
         ],
         "endpoints": {
             "health": "/health",
@@ -820,7 +818,7 @@ def root():
             "stats": "/api/stats"
         },
         "modes": {
-            "auto": "Smart: PLCnext → RAG, Others → LLM + Web Search",
+            "auto": "Smart: PLCnext -> RAG, Others -> LLM + Web Search",
             "fast": "Direct LLM with web search (~5-15s)",
             "deep": "RAG for PLCnext docs (~30-60s)"
         }
