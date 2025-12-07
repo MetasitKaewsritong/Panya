@@ -25,14 +25,14 @@ services:
     environment:
       - OLLAMA_NUM_PARALLEL=1
       - OLLAMA_MAX_LOADED_MODELS=1
-      - OLLAMA_KEEP_ALIVE=5m
+      - OLLAMA_KEEP_ALIVE=-1       # ⚡ เก็บ model ไว้ตลอด ไม่ unload!
       - OLLAMA_HOST=0.0.0.0:11434
     volumes:
       - ollama_data:/root/.ollama
     ports:
-      - "11434:11434"
+      - "11435:11434"
     restart: unless-stopped
-    # ⚡ เพิ่ม GPU support
+    # ⚡ GPU support
     deploy:
       resources:
         reservations:

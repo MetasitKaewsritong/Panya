@@ -1,4 +1,7 @@
 # backend/main.py
+# ✅ VERSION 2.5 - ENGLISH ONLY OUTPUT
+# Changes from 2.4:
+# - ask_llm_directly now enforces English-only responses
 
 import os
 import logging
@@ -6,11 +9,13 @@ import requests
 import time
 import math
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Optional, List
 import numpy as np
 import io
 import mimetypes
 import warnings
+import json
+import re
 
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,6 +41,20 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 
+# ⚡ โหมดการอ่านไฟล์
+FAST_MODE_CHARS = 8000
+DEEP_MODE_CHARS = 60000
+AUTO_THRESHOLD = 10000
+
+# Keywords สำหรับ PLCnext (ใช้ RAG)
+PLCNEXT_KEYWORDS = [
+    "plcnext", "plc next", "phoenix contact", "axc", "axl", "axioline",
+    "profinet", "modbus", "opcua", "opc ua", "gds", "global data space",
+    "esm", "execution", "synchronization", "firmware", "wbm",
+    "iec 61131", "structured text", "function block", "ladder", "fbd",
+    "proficloud", "plcnext store", "plcnext engineer"
+]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.info("🔧 Configuration:")
 logging.info(f"  DB_URL: {DB_URL}")
@@ -57,6 +76,75 @@ def _to_bool(val: Any) -> Optional[bool]:
     if s in ("0", "false", "no", "n", "off"):
         return False
     return None
+
+
+def is_plcnext_specific_question(question: str) -> bool:
+    """ตรวจสอบว่าคำถามเกี่ยวกับ PLCnext หรือไม่"""
+    question_lower = question.lower()
+    for keyword in PLCNEXT_KEYWORDS:
+        if keyword in question_lower:
+            return True
+    return False
+
+
+# ✅ NEW: Web Search ที่ใช้งานได้จริง
+def web_search(query: str, max_results: int = 5) -> str:
+    """
+    ค้นหาข้อมูลจากอินเทอร์เน็ตโดยใช้ DuckDuckGo HTML
+    """
+    try:
+        # ใช้ DuckDuckGo HTML search
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # URL encode query
+        from urllib.parse import quote_plus
+        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        
+        response = requests.get(search_url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            # Parse HTML ง่ายๆ ด้วย regex
+            html = response.text
+            
+            # หา snippets จาก result
+            results = []
+            
+            # Pattern สำหรับหา result snippets
+            snippet_pattern = r'<a class="result__snippet"[^>]*>(.*?)</a>'
+            snippets = re.findall(snippet_pattern, html, re.DOTALL)
+            
+            for i, snippet in enumerate(snippets[:max_results]):
+                # ลบ HTML tags
+                clean_snippet = re.sub(r'<[^>]+>', '', snippet)
+                clean_snippet = clean_snippet.strip()
+                if clean_snippet:
+                    results.append(f"- {clean_snippet}")
+            
+            # หา titles ด้วย
+            title_pattern = r'<a class="result__a"[^>]*>(.*?)</a>'
+            titles = re.findall(title_pattern, html, re.DOTALL)
+            
+            if results:
+                logging.info(f"🌐 Web search found {len(results)} results for: {query[:50]}")
+                return "\n".join(results)
+            elif titles:
+                # ถ้าไม่มี snippets ให้ใช้ titles
+                clean_titles = []
+                for title in titles[:max_results]:
+                    clean_title = re.sub(r'<[^>]+>', '', title).strip()
+                    if clean_title:
+                        clean_titles.append(f"- {clean_title}")
+                return "\n".join(clean_titles)
+        
+        logging.warning(f"⚠️ Web search returned status {response.status_code}")
+        return ""
+        
+    except Exception as e:
+        logging.error(f"🔥 Web search error: {e}")
+        return ""
+
 
 def wait_for_ollama():
     logging.info("🔄 Checking Ollama service readiness...")
@@ -134,24 +222,15 @@ def sanitize_json(obj: Any):
     return obj
 
 
-# ⚡ ฟังก์ชันใหม่: อ่านเนื้อหาจากไฟล์ต่างๆ
 def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -> str:
-    """
-    อ่านเนื้อหาจากไฟล์หลายประเภท
-    รองรับ: PDF, TXT, CSV, JSON, DOCX, Image (OCR)
-    """
-    import json
-    
+    """อ่านเนื้อหาจากไฟล์หลายประเภท"""
     try:
-        # 1. Text files (.txt)
         if mime_type == "text/plain" or filename.endswith(".txt"):
             return file_content.decode("utf-8", errors="ignore")
         
-        # 2. CSV files
         if mime_type == "text/csv" or filename.endswith(".csv"):
             return file_content.decode("utf-8", errors="ignore")
         
-        # 3. JSON files
         if mime_type == "application/json" or filename.endswith(".json"):
             try:
                 data = json.loads(file_content.decode("utf-8"))
@@ -159,10 +238,9 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
             except:
                 return file_content.decode("utf-8", errors="ignore")
         
-        # 4. PDF files
         if mime_type == "application/pdf" or filename.endswith(".pdf"):
             try:
-                import fitz  # PyMuPDF
+                import fitz
                 pdf_document = fitz.open(stream=file_content, filetype="pdf")
                 text = ""
                 for page in pdf_document:
@@ -170,7 +248,6 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
                 pdf_document.close()
                 return text.strip()
             except ImportError:
-                logging.warning("PyMuPDF not installed. Trying pdfplumber...")
                 try:
                     import pdfplumber
                     with pdfplumber.open(io.BytesIO(file_content)) as pdf:
@@ -179,9 +256,8 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
                             text += (page.extract_text() or "") + "\n"
                     return text.strip()
                 except ImportError:
-                    return "[Error: PDF reader not installed. Please install PyMuPDF or pdfplumber]"
+                    return "[Error: PDF reader not installed]"
         
-        # 5. Word documents (.docx)
         if filename.endswith(".docx"):
             try:
                 from docx import Document
@@ -191,7 +267,6 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
             except ImportError:
                 return "[Error: python-docx not installed]"
         
-        # 6. Image files (OCR)
         if mime_type and mime_type.startswith("image"):
             try:
                 image = Image.open(io.BytesIO(file_content))
@@ -200,12 +275,97 @@ def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -
             except Exception as e:
                 return f"[Error reading image: {str(e)}]"
         
-        # 7. Unknown file type
         return f"[Unsupported file type: {mime_type or filename}]"
         
     except Exception as e:
         logging.error(f"🔥 Error extracting text from file: {e}")
         return f"[Error reading file: {str(e)}]"
+
+
+# ✅ UPDATED v2.5: ถาม LLM โดยตรง - ENGLISH ONLY
+def ask_llm_directly(llm, question: str, file_content: str = "", filename: str = "", 
+                     mode: str = "auto", chat_history: List[dict] = None,
+                     web_context: str = "") -> dict:
+    """
+    ส่งคำถามไป LLM โดยตรง - ตอบได้ทุกเรื่อง ไม่จำกัดแค่ PLCnext
+    ENGLISH ONLY OUTPUT
+    """
+    start_time = time.perf_counter()
+    
+    # Build chat history string
+    history_str = ""
+    if chat_history:
+        for msg in chat_history[-10:]:
+            role = "User" if msg.get("sender") == "user" else "Assistant"
+            text = msg.get("text", "")[:500]
+            history_str += f"{role}: {text}\n"
+    
+    # Handle file content
+    file_section = ""
+    if file_content:
+        original_length = len(file_content)
+        max_chars = DEEP_MODE_CHARS if mode == "deep" else FAST_MODE_CHARS
+        truncated = len(file_content) > max_chars
+        if truncated:
+            file_content = file_content[:max_chars]
+        
+        file_section = f"""
+=== UPLOADED FILE: {filename} ===
+{file_content}
+{"[... content truncated ...]" if truncated else ""}
+===
+"""
+    
+    # Web search section
+    web_section = ""
+    if web_context:
+        web_section = f"""
+=== WEB SEARCH RESULTS ===
+{web_context}
+===
+"""
+    
+    # ✅ ENGLISH ONLY PROMPT
+    prompt = f"""You are Panya, a helpful AI assistant.
+
+LANGUAGE RULE: You must ALWAYS answer in English only. Even if the user asks in Thai, Chinese, Japanese, German, or any other language, you must respond in English. Never respond in any language other than English.
+
+IMPORTANT: PLCnext is made by Phoenix Contact (NOT Siemens, NOT Schneider Electric!).
+
+{"=== CONVERSATION HISTORY ===" + chr(10) + history_str + "===" if history_str else ""}
+
+{file_section}
+
+{web_section}
+
+**User's Question:** {question}
+
+**Instructions:**
+1. Answer the question thoroughly and helpfully IN ENGLISH
+2. If there is conversation history, use it to maintain context
+3. If there is file content, analyze and reference it
+4. If there are web search results, use them to provide accurate information
+5. Be detailed and informative - don't give short, unhelpful answers
+6. If asked about PLCnext/PLC details, say "Please use Deep mode for accurate PLCnext information"
+
+**Your answer in English:**"""
+
+    try:
+        response = llm.invoke(prompt)
+        total_time = time.perf_counter() - start_time
+        
+        return {
+            "reply": response,
+            "processing_time": total_time,
+            "mode": mode
+        }
+    except Exception as e:
+        logging.error(f"🔥 Error asking LLM: {e}")
+        return {
+            "reply": f"Error: {str(e)}",
+            "processing_time": time.perf_counter() - start_time,
+            "mode": mode
+        }
 
 
 # ---- FastAPI Lifespan ----
@@ -239,8 +399,8 @@ async def lifespan(app: FastAPI):
             app.state.llm = OllamaLLM(
                 model=OLLAMA_MODEL,
                 base_url=OLLAMA_BASE_URL,
-                temperature=0.0,
-                timeout=120
+                temperature=0.7,
+                timeout=180
             )
             logging.info(f"✅ LLM ({OLLAMA_MODEL}) loaded.")
         except Exception as e:
@@ -265,9 +425,9 @@ async def lifespan(app: FastAPI):
 # ---- App init ----
 app = FastAPI(
     lifespan=lifespan,
-    title="PLCnext Chatbot v2.0",
-    description="Advanced RAG chatbot for PLCnext Technology documentation",
-    version="2.0.0"
+    title="PLCnext Chatbot v2.5",
+    description="General AI Assistant with RAG for PLCnext + Web Search (English Only)",
+    version="2.5.0"
 )
 
 app.add_middleware(
@@ -317,6 +477,13 @@ def chat(fastapi_request: Request, chat_request: ChatRequest):
     llm = fastapi_request.app.state.llm
     embedder = fastapi_request.app.state.embedder
 
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    if not llm:
+        raise HTTPException(status_code=503, detail="LLM not available")
+    if not embedder:
+        raise HTTPException(status_code=503, detail="Embedder not available")
+
     result = answer_question(
         question=chat_request.message,
         db_pool=db_pool,
@@ -324,18 +491,11 @@ def chat(fastapi_request: Request, chat_request: ChatRequest):
         embedder=embedder,
         collection=chat_request.collection,
         retriever_class=PostgresVectorRetriever,
-        reranker_class=EnhancedFlashrankRerankRetriever
+        reranker_class=EnhancedFlashrankRerankRetriever,
     )
+    return ChatResponse(**result)
 
-    return ChatResponse(
-        reply=result["reply"],
-        processing_time=result.get("processing_time"),
-        retrieval_time=result.get("retrieval_time"),
-        context_count=result.get("context_count"),
-        ragas=None
-    )
 
-# ⚡ Streaming endpoint
 @app.post("/api/chat/stream")
 def chat_stream(fastapi_request: Request, chat_request: ChatRequest):
     db_pool = fastapi_request.app.state.db_pool
@@ -397,11 +557,13 @@ def chat_stream_get(message: str, collection: str = "plcnext", request: Request 
     )
 
 
-# ⚡ แก้ไข agent-chat ให้รองรับไฟล์หลายประเภท
+# ✅ agent-chat v2.5 - ENGLISH ONLY
 @app.post("/api/agent-chat")
 def agent_chat(
     message: str = Form(""),
     file: UploadFile = File(None),
+    mode: str = Form("auto"),
+    chat_history: str = Form("[]"),
     log_eval: bool = Form(False),
     enable_ragas: bool = Form(False),
     fast_ragas: bool | None = Form(None),
@@ -409,37 +571,139 @@ def agent_chat(
     use_rerank: Any = Form(None),
     use_rank: Any = Form(None),
 ):
+    start_time = time.perf_counter()
+    
+    # Parse chat history
+    try:
+        history = json.loads(chat_history) if chat_history else []
+    except:
+        history = []
+    
+    # Validate mode
+    if mode not in ["auto", "fast", "deep"]:
+        mode = "auto"
+    
+    # เก็บ original mode ไว้แสดงผล
+    display_mode = mode
+    
+    # ตัดสินใจ internal mode
+    internal_mode = mode
+    file_text = ""
+    file_content_bytes = None
+    mime_type = None
+    
+    if file:
+        file_content_bytes = file.file.read()
+        mime_type, _ = mimetypes.guess_type(file.filename)
+        
+        if mime_type and mime_type.startswith("audio"):
+            return {"error": "Please use /api/transcribe for audio files"}
+        
+        file_text = extract_text_from_file(file_content_bytes, file.filename, mime_type)
+        logging.info(f"📄 Extracted {len(file_text)} characters from {file.filename}")
+        
+        if mode == "auto":
+            if len(file_text) > AUTO_THRESHOLD:
+                internal_mode = "fast"
+            else:
+                internal_mode = "deep"
+    else:
+        if mode == "auto":
+            # ถ้าเกี่ยวกับ PLCnext → Deep (RAG)
+            # ถ้าไม่ → Fast (LLM + web search ถ้าจำเป็น)
+            if is_plcnext_specific_question(message):
+                internal_mode = "deep"
+            else:
+                internal_mode = "fast"
+    
+    logging.info(f"🎯 Mode: {display_mode} (internal: {internal_mode})")
+    
+    # ====================================
+    # 🚀 FAST MODE - ENGLISH ONLY
+    # ====================================
+    if internal_mode == "fast":
+        # ลอง search เว็บก่อนถ้าไม่ใช่คำถามทั่วไป
+        web_context = ""
+        
+        # ตรวจสอบว่าควร search หรือไม่
+        should_search = any([
+            "netflix" in message.lower(),
+            "google" in message.lower(),
+            "facebook" in message.lower(),
+            "amazon" in message.lower(),
+            "microsoft" in message.lower(),
+            "apple" in message.lower(),
+            "company" in message.lower(),
+            "price" in message.lower(),
+            "news" in message.lower(),
+            "latest" in message.lower(),
+            "2024" in message.lower(),
+            "2025" in message.lower(),
+        ])
+        
+        if should_search:
+            logging.info(f"🌐 Searching web for: {message[:50]}...")
+            web_context = web_search(message)
+        
+        result = ask_llm_directly(
+            llm=app.state.llm,
+            question=message,
+            file_content=file_text,
+            filename=file.filename if file else "",
+            mode=display_mode,
+            chat_history=history,
+            web_context=web_context
+        )
+        
+        total_time = time.perf_counter() - start_time
+        
+        response = {
+            "reply": result.get("reply", ""),
+            "processing_time": total_time,
+            "retrieval_time": 0,
+            "context_count": 0,
+            "contexts": [],
+            "eval": None,
+            "ragas": None,
+            "use_rerank": False,
+            "file_processed": file.filename if file else None,
+            "mode": display_mode,
+            "web_searched": bool(web_context)
+        }
+        return sanitize_json(response)
+    
+    # ====================================
+    # 🔍 DEEP MODE - RAG สำหรับ PLCnext
+    # ====================================
     parsed_rerank = _to_bool(use_rerank)
-    parsed_alias  = _to_bool(use_rank)
+    parsed_alias = _to_bool(use_rank)
     decided = parsed_rerank if parsed_rerank is not None else parsed_alias
     if decided is None:
         decided = os.getenv("USE_RERANK_DEFAULT", "true").strip().lower() in ("1","true","yes","y","on")
-    use_rerank = decided
-    reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank else NoRerankRetriever
-
-    # ⚡ ปรับปรุงการจัดการไฟล์
-    file_text = ""
-    if file:
-        content = file.file.read()
-        mime_type, _ = mimetypes.guess_type(file.filename)
-        
-        # ⚡ รองรับไฟล์หลายประเภท
-        if mime_type and mime_type.startswith("audio"):
-            # Audio files - ใช้ transcribe endpoint แทน
-            return {"error": "Please use /api/transcribe for audio files"}
-        else:
-            # ทุกประเภทอื่นๆ - extract text
-            file_text = extract_text_from_file(content, file.filename, mime_type)
-            logging.info(f"📄 Extracted {len(file_text)} characters from {file.filename}")
+    use_rerank_flag = decided
+    reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank_flag else NoRerankRetriever
     
-    # รวม message กับ file content
-    combined_message = message
+    # รวม chat history
+    history_context = ""
+    if history:
+        recent_history = history[-6:]
+        for msg in recent_history:
+            role = "User" if msg.get("sender") == "user" else "Assistant"
+            history_context += f"{role}: {msg.get('text', '')[:200]}\n"
+    
+    # แยก retrieval query กับ LLM context
+    retrieval_query = message
+    llm_context = message
+    if history_context:
+        llm_context = f"[Previous conversation]\n{history_context}\n[Current question]\n{message}"
+    
     if file_text:
-        combined_message = f"{message}\n\n--- File Content ({file.filename if file else 'unknown'}) ---\n{file_text}"
+        truncated_file_text = file_text[:DEEP_MODE_CHARS] if len(file_text) > DEEP_MODE_CHARS else file_text
+        retrieval_query = f"{message}\n\n--- File Content ({file.filename}) ---\n{truncated_file_text}"
+        llm_context = f"{llm_context}\n\n--- File Content ({file.filename}) ---\n{truncated_file_text}"
 
-    start_time = time.perf_counter()
     result = answer_question(
-        question=combined_message,
+        question=retrieval_query,
         db_pool=app.state.db_pool,
         llm=app.state.llm,
         embedder=app.state.embedder,
@@ -447,22 +711,43 @@ def agent_chat(
         retriever_class=PostgresVectorRetriever,
         reranker_class=reranker_cls,
     )
-    total_time = time.perf_counter() - start_time
-
+    
     contexts = result.get("contexts_list") or result.get("contexts") or []
+    reply_text = result.get("llm_answer", "") or result.get("reply", "")
+    
+    # Fallback ถ้าไม่เจอข้อมูล
+    if "I could not find relevant information" in reply_text or not reply_text.strip():
+        logging.info(f"⚠️ Deep Mode: No context found, using general LLM...")
+        
+        # ใช้ LLM โดยตรง
+        result = ask_llm_directly(
+            llm=app.state.llm,
+            question=message,
+            file_content=file_text,
+            filename=file.filename if file else "",
+            mode=display_mode,
+            chat_history=history,
+            web_context=""
+        )
+        reply_text = result.get("reply", "")
+    
+    total_time = time.perf_counter() - start_time
+    logging.info(f"📊 Deep Mode: Time: {total_time:.2f}s")
 
     response = {
-        "reply": result.get("llm_answer", "") or result.get("reply", ""),
+        "reply": reply_text,
         "processing_time": result.get("processing_time", total_time),
         "retrieval_time": result.get("retrieval_time", None),
         "context_count": result.get("context_count", None),
         "contexts": contexts,
         "eval": None,
         "ragas": None,
-        "use_rerank": use_rerank,
+        "use_rerank": use_rerank_flag,
         "file_processed": file.filename if file else None,
+        "mode": display_mode
     }
     return sanitize_json(response)
+
 
 @app.get("/api/collections")
 def get_collections(request: Request):
@@ -517,16 +802,26 @@ def get_stats(request: Request):
 @app.get("/")
 def root():
     return {
-        "message": "PLCnext Chatbot API v2.0",
+        "message": "PLCnext Chatbot API v2.5 - English Only Output",
+        "features": [
+            "Answer ANY topic (not just PLCnext)",
+            "Chat History Support",
+            "Web Search for current information", 
+            "RAG for PLCnext documentation",
+            "English-only output"
+        ],
         "endpoints": {
             "health": "/health",
             "chat": "/api/chat",
-            "chat_stream": "/api/chat/stream",
             "agent_chat": "/api/agent-chat",
             "collections": "/api/collections",
             "stats": "/api/stats"
         },
-        "supported_files": ["image/*", "audio/*", "pdf", "txt", "csv", "json", "docx"]
+        "modes": {
+            "auto": "Smart: PLCnext -> RAG, Others -> LLM + Web Search",
+            "fast": "Direct LLM with web search (~5-15s)",
+            "deep": "RAG for PLCnext docs (~30-60s)"
+        }
     }
 
 @app.post("/api/transcribe")
