@@ -1,71 +1,135 @@
-# backend/main.py
-# ✅ VERSION 2.5 - ENGLISH ONLY OUTPUT
-# Changes from 2.4:
-# - ask_llm_directly now enforces English-only responses
+# ============================================================================
+# backend/main.py v3.0 - Universal PLC Assistant
+# ============================================================================
+# CHANGES FROM ORIGINAL:
+# 1. ✅ Removed Auto mode entirely - only Fast and Deep modes
+# 2. ✅ Generic PLC branding (removed all PLCnext-specific references)
+# 3. ✅ Improved code organization with clear sections
+# 4. ✅ Better error handling and logging
+# 5. ✅ Performance optimizations
+# 6. ✅ Cleaner prompt engineering
+# 7. ✅ Added comprehensive documentation
+#
+# MODE EXPLANATION:
+# ─────────────────────────────────────────────────────────────────────────────
+# FAST MODE (default):
+#   - Direct LLM response WITHOUT searching the vector database
+#   - Optional web search for current information
+#   - Best for: General PLC concepts, quick troubleshooting tips, syntax help
+#   - Response time: ~5-15 seconds
+#   - Use when: You need quick answers or asking about general topics
+#
+# DEEP MODE:
+#   - Uses RAG (Retrieval-Augmented Generation) pipeline
+#   - Searches vector database for relevant documentation chunks
+#   - Applies reranking for better context selection
+#   - Best for: Specific documentation lookups, detailed specs, accuracy-critical
+#   - Response time: ~30-60 seconds  
+#   - Use when: You need precise information from your embedded documents
+# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================================
 
 import os
 import logging
 import requests
 import time
 import math
-from contextlib import asynccontextmanager
-from typing import Any, Optional, List
-import numpy as np
+import re
+import json
 import io
 import mimetypes
 import warnings
-import json
-import re
+from contextlib import asynccontextmanager
+from typing import Any, Optional, List, Dict
+from functools import lru_cache
 
+import numpy as np
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
 
-from app.eval_logging import ollama_generate_with_stats, append_eval_run
 from langchain_ollama import OllamaLLM
 from sentence_transformers import SentenceTransformer
 from psycopg2 import pool
-
-from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever, NoRerankRetriever
-from app.chatbot import answer_question, answer_question_stream
-
 import pytesseract
 from PIL import Image
 
+# Local imports
+from app.eval_logging import ollama_generate_with_stats, append_eval_run
+from app.retriever import (
+    PostgresVectorRetriever, 
+    EnhancedFlashrankRerankRetriever, 
+    NoRerankRetriever
+)
+from app.chatbot import answer_question, answer_question_stream
+
+# Suppress warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# ---- Config ----
-DB_URL = os.getenv("DATABASE_URL")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# ⚡ โหมดการอ่านไฟล์
-FAST_MODE_CHARS = 8000
-DEEP_MODE_CHARS = 60000
-AUTO_THRESHOLD = 10000
+class Config:
+    """Centralized configuration management"""
+    
+    # Database
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://user:password@postgres:5432/plcdb")
+    
+    # Ollama LLM
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2")
+    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+    LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "180"))
+    
+    # Embeddings
+    EMBED_MODEL_NAME: str = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+    
+    # File processing limits
+    FAST_MODE_CHARS: int = int(os.getenv("FAST_MODE_CHARS", "8000"))
+    DEEP_MODE_CHARS: int = int(os.getenv("DEEP_MODE_CHARS", "60000"))
+    
+    # Web search
+    WEB_SEARCH_TIMEOUT: int = int(os.getenv("WEB_SEARCH_TIMEOUT", "10"))
+    WEB_SEARCH_MAX_RESULTS: int = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+    
+    # Database pool
+    DB_POOL_MIN: int = int(os.getenv("DB_POOL_MIN", "1"))
+    DB_POOL_MAX: int = int(os.getenv("DB_POOL_MAX", "10"))
+    
+    # Default collection name for vector store
+    DEFAULT_COLLECTION: str = os.getenv("DEFAULT_COLLECTION", "plc_docs")
 
-# Keywords สำหรับ PLCnext (ใช้ RAG)
-PLCNEXT_KEYWORDS = [
-    "plcnext", "plc next", "phoenix contact", "axc", "axl", "axioline",
-    "profinet", "modbus", "opcua", "opc ua", "gds", "global data space",
-    "esm", "execution", "synchronization", "firmware", "wbm",
-    "iec 61131", "structured text", "function block", "ladder", "fbd",
-    "proficloud", "plcnext store", "plcnext engineer"
-]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logging.info("🔧 Configuration:")
-logging.info(f"  DB_URL: {DB_URL}")
-logging.info(f"  OLLAMA_BASE_URL: {OLLAMA_BASE_URL}")
-logging.info(f"  OLLAMA_MODEL: {OLLAMA_MODEL}")
-logging.info(f"  EMBED_MODEL: {EMBED_MODEL_NAME}")
+config = Config()
 
-# -------------------------
-# Helpers
-# -------------------------
-def _to_bool(val: Any) -> Optional[bool]:
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("PLCAssistant")
+
+logger.info("=" * 60)
+logger.info("🤖 PLC Assistant v3.0 - Starting up")
+logger.info("=" * 60)
+logger.info(f"  Database URL: {config.DATABASE_URL[:50]}...")
+logger.info(f"  Ollama URL: {config.OLLAMA_BASE_URL}")
+logger.info(f"  Ollama Model: {config.OLLAMA_MODEL}")
+logger.info(f"  Embed Model: {config.EMBED_MODEL_NAME}")
+logger.info("=" * 60)
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def to_bool(val: Any) -> Optional[bool]:
+    """Convert various types to boolean"""
     if val is None:
         return None
     if isinstance(val, bool):
@@ -78,133 +142,15 @@ def _to_bool(val: Any) -> Optional[bool]:
     return None
 
 
-def is_plcnext_specific_question(question: str) -> bool:
-    """ตรวจสอบว่าคำถามเกี่ยวกับ PLCnext หรือไม่"""
-    question_lower = question.lower()
-    for keyword in PLCNEXT_KEYWORDS:
-        if keyword in question_lower:
-            return True
-    return False
-
-
-# ✅ NEW: Web Search ที่ใช้งานได้จริง
-def web_search(query: str, max_results: int = 5) -> str:
+def sanitize_json(obj: Any) -> Any:
     """
-    ค้นหาข้อมูลจากอินเทอร์เน็ตโดยใช้ DuckDuckGo HTML
+    Recursively sanitize objects for JSON serialization.
+    Handles numpy types and invalid float values.
     """
-    try:
-        # ใช้ DuckDuckGo HTML search
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        # URL encode query
-        from urllib.parse import quote_plus
-        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        
-        response = requests.get(search_url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            # Parse HTML ง่ายๆ ด้วย regex
-            html = response.text
-            
-            # หา snippets จาก result
-            results = []
-            
-            # Pattern สำหรับหา result snippets
-            snippet_pattern = r'<a class="result__snippet"[^>]*>(.*?)</a>'
-            snippets = re.findall(snippet_pattern, html, re.DOTALL)
-            
-            for i, snippet in enumerate(snippets[:max_results]):
-                # ลบ HTML tags
-                clean_snippet = re.sub(r'<[^>]+>', '', snippet)
-                clean_snippet = clean_snippet.strip()
-                if clean_snippet:
-                    results.append(f"- {clean_snippet}")
-            
-            # หา titles ด้วย
-            title_pattern = r'<a class="result__a"[^>]*>(.*?)</a>'
-            titles = re.findall(title_pattern, html, re.DOTALL)
-            
-            if results:
-                logging.info(f"🌐 Web search found {len(results)} results for: {query[:50]}")
-                return "\n".join(results)
-            elif titles:
-                # ถ้าไม่มี snippets ให้ใช้ titles
-                clean_titles = []
-                for title in titles[:max_results]:
-                    clean_title = re.sub(r'<[^>]+>', '', title).strip()
-                    if clean_title:
-                        clean_titles.append(f"- {clean_title}")
-                return "\n".join(clean_titles)
-        
-        logging.warning(f"⚠️ Web search returned status {response.status_code}")
-        return ""
-        
-    except Exception as e:
-        logging.error(f"🔥 Web search error: {e}")
-        return ""
-
-
-def wait_for_ollama():
-    logging.info("🔄 Checking Ollama service readiness...")
-    for attempt in range(30):
-        try:
-            response = requests.get(f"{OLLAMA_BASE_URL}/api/version", timeout=5)
-            if response.status_code == 200:
-                logging.info("✅ Ollama service is ready.")
-                return True
-        except requests.exceptions.RequestException:
-            logging.info(f"⏳ Waiting for Ollama service... (attempt {attempt + 1}/30)")
-            time.sleep(2)
-    logging.error("❌ Ollama service not ready after timeout.")
-    return False
-
-def ensure_model(model_name: str) -> bool:
-    try:
-        logging.info(f"🔄 Checking for LLM model: '{model_name}'")
-        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10)
-        r.raise_for_status()
-        models = r.json().get("models", [])
-        available_full = {m.get("name", "") for m in models}
-        available_base = {m.get("name", "").split(":")[0] for m in models}
-        base = model_name.split(":")[0]
-        if model_name in available_full or base in available_base:
-            logging.info(f"✅ Model '{model_name}' is available.")
-            return True
-        logging.warning(f"⚠️ Model '{model_name}' not found. Pulling now...")
-        pr = requests.post(f"{OLLAMA_BASE_URL}/api/pull", json={"name": model_name}, timeout=1800)
-        if pr.status_code == 200:
-            logging.info(f"✅ Model '{model_name}' pulled successfully.")
-            return True
-        logging.error(f"❌ Failed to pull model '{model_name}': {pr.text}")
-        return False
-    except Exception as e:
-        logging.error(f"🔥 Error ensuring model '{model_name}': {e}")
-        return False
-
-def test_database_connection():
-    try:
-        import psycopg2
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        cur.execute("SELECT extname FROM pg_extension WHERE extname = 'vector';")
-        if not cur.fetchone():
-            logging.error("❌ pgvector extension not found!")
-            return False
-        cur.execute("SELECT COUNT(*) FROM documents;")
-        doc_count = cur.fetchone()[0]
-        logging.info(f"✅ Database connected. Documents count: {doc_count}")
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        logging.error(f"🔥 Database connection test failed: {e}")
-        return False
-
-def sanitize_json(obj: Any):
     if obj is None:
         return None
+    
+    # Handle numpy types
     if isinstance(obj, (np.float32, np.float64)):
         if np.isnan(obj) or np.isinf(obj):
             return None
@@ -213,223 +159,454 @@ def sanitize_json(obj: Any):
         return int(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
+    
+    # Handle Python float
     if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
         return None
+    
+    # Handle containers
     if isinstance(obj, dict):
         return {k: sanitize_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [sanitize_json(v) for v in obj]
+    
     return obj
 
 
-def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -> str:
-    """อ่านเนื้อหาจากไฟล์หลายประเภท"""
+# ============================================================================
+# WEB SEARCH
+# ============================================================================
+
+def web_search(query: str, max_results: int = None) -> str:
+    """
+    Search the web using DuckDuckGo HTML interface.
+    
+    Args:
+        query: Search query string
+        max_results: Maximum number of results to return
+        
+    Returns:
+        Formatted string of search results or empty string on failure
+    """
+    if max_results is None:
+        max_results = config.WEB_SEARCH_MAX_RESULTS
+        
     try:
-        if mime_type == "text/plain" or filename.endswith(".txt"):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        from urllib.parse import quote_plus
+        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        
+        response = requests.get(
+            search_url, 
+            headers=headers, 
+            timeout=config.WEB_SEARCH_TIMEOUT
+        )
+        
+        if response.status_code != 200:
+            logger.warning(f"Web search returned status {response.status_code}")
+            return ""
+        
+        html = response.text
+        results = []
+        
+        # Extract snippets
+        snippet_pattern = r'<a class="result__snippet"[^>]*>(.*?)</a>'
+        snippets = re.findall(snippet_pattern, html, re.DOTALL)
+        
+        for snippet in snippets[:max_results]:
+            clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
+            if clean_snippet:
+                results.append(f"• {clean_snippet}")
+        
+        if results:
+            logger.info(f"🌐 Web search found {len(results)} results for: {query[:50]}...")
+            return "\n".join(results)
+        
+        # Fallback to titles if no snippets
+        title_pattern = r'<a class="result__a"[^>]*>(.*?)</a>'
+        titles = re.findall(title_pattern, html, re.DOTALL)
+        
+        for title in titles[:max_results]:
+            clean_title = re.sub(r'<[^>]+>', '', title).strip()
+            if clean_title:
+                results.append(f"• {clean_title}")
+        
+        return "\n".join(results) if results else ""
+        
+    except requests.exceptions.Timeout:
+        logger.warning("Web search timed out")
+        return ""
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+        return ""
+
+
+# ============================================================================
+# SERVICE INITIALIZATION HELPERS
+# ============================================================================
+
+def wait_for_ollama(max_attempts: int = 30, delay: float = 2.0) -> bool:
+    """Wait for Ollama service to become available"""
+    logger.info("🔄 Checking Ollama service readiness...")
+    
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(
+                f"{config.OLLAMA_BASE_URL}/api/version", 
+                timeout=5
+            )
+            if response.status_code == 200:
+                version = response.json().get("version", "unknown")
+                logger.info(f"✅ Ollama service is ready (version: {version})")
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        
+        logger.info(f"⏳ Waiting for Ollama... (attempt {attempt + 1}/{max_attempts})")
+        time.sleep(delay)
+    
+    logger.error("❌ Ollama service not ready after timeout")
+    return False
+
+
+def ensure_model(model_name: str) -> bool:
+    """Ensure the required LLM model is available, pulling if necessary"""
+    try:
+        logger.info(f"🔄 Checking for model: '{model_name}'")
+        
+        response = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=10)
+        response.raise_for_status()
+        
+        models = response.json().get("models", [])
+        available_names = {m.get("name", "") for m in models}
+        available_base = {m.get("name", "").split(":")[0] for m in models}
+        
+        base_name = model_name.split(":")[0]
+        
+        if model_name in available_names or base_name in available_base:
+            logger.info(f"✅ Model '{model_name}' is available")
+            return True
+        
+        logger.warning(f"⚠️ Model '{model_name}' not found, pulling...")
+        pull_response = requests.post(
+            f"{config.OLLAMA_BASE_URL}/api/pull",
+            json={"name": model_name},
+            timeout=1800  # 30 min timeout for large models
+        )
+        
+        if pull_response.status_code == 200:
+            logger.info(f"✅ Model '{model_name}' pulled successfully")
+            return True
+        
+        logger.error(f"❌ Failed to pull model: {pull_response.text}")
+        return False
+        
+    except Exception as e:
+        logger.error(f"🔥 Error ensuring model: {e}")
+        return False
+
+
+def test_database_connection() -> bool:
+    """Test database connection and verify pgvector extension"""
+    try:
+        import psycopg2
+        conn = psycopg2.connect(config.DATABASE_URL)
+        cur = conn.cursor()
+        
+        # Check pgvector extension
+        cur.execute("SELECT extname FROM pg_extension WHERE extname = 'vector';")
+        if not cur.fetchone():
+            logger.error("❌ pgvector extension not found!")
+            return False
+        
+        # Get document count
+        cur.execute("SELECT COUNT(*) FROM documents;")
+        doc_count = cur.fetchone()[0]
+        
+        logger.info(f"✅ Database connected. Documents: {doc_count}")
+        
+        cur.close()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        logger.error(f"🔥 Database connection failed: {e}")
+        return False
+
+
+# ============================================================================
+# FILE PROCESSING
+# ============================================================================
+
+def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -> str:
+    """
+    Extract text content from various file types.
+    
+    Supported formats:
+    - Text files (.txt)
+    - CSV files (.csv)
+    - JSON files (.json)
+    - PDF files (.pdf) - requires PyMuPDF or pdfplumber
+    - Word documents (.docx) - requires python-docx
+    - Images - requires pytesseract (OCR)
+    """
+    filename_lower = filename.lower()
+    
+    try:
+        # Plain text
+        if mime_type == "text/plain" or filename_lower.endswith(".txt"):
             return file_content.decode("utf-8", errors="ignore")
         
-        if mime_type == "text/csv" or filename.endswith(".csv"):
+        # CSV
+        if mime_type == "text/csv" or filename_lower.endswith(".csv"):
             return file_content.decode("utf-8", errors="ignore")
         
-        if mime_type == "application/json" or filename.endswith(".json"):
+        # JSON
+        if mime_type == "application/json" or filename_lower.endswith(".json"):
             try:
                 data = json.loads(file_content.decode("utf-8"))
                 return json.dumps(data, indent=2, ensure_ascii=False)
-            except:
+            except json.JSONDecodeError:
                 return file_content.decode("utf-8", errors="ignore")
         
-        if mime_type == "application/pdf" or filename.endswith(".pdf"):
+        # PDF
+        if mime_type == "application/pdf" or filename_lower.endswith(".pdf"):
+            # Try PyMuPDF first (faster)
             try:
                 import fitz
-                pdf_document = fitz.open(stream=file_content, filetype="pdf")
-                text = ""
-                for page in pdf_document:
-                    text += page.get_text()
-                pdf_document.close()
+                pdf_doc = fitz.open(stream=file_content, filetype="pdf")
+                text = "\n".join(page.get_text() for page in pdf_doc)
+                pdf_doc.close()
                 return text.strip()
             except ImportError:
-                try:
-                    import pdfplumber
-                    with pdfplumber.open(io.BytesIO(file_content)) as pdf:
-                        text = ""
-                        for page in pdf.pages:
-                            text += (page.extract_text() or "") + "\n"
-                    return text.strip()
-                except ImportError:
-                    return "[Error: PDF reader not installed]"
+                pass
+            
+            # Fallback to pdfplumber
+            try:
+                import pdfplumber
+                with pdfplumber.open(io.BytesIO(file_content)) as pdf:
+                    text = "\n".join(
+                        page.extract_text() or "" 
+                        for page in pdf.pages
+                    )
+                return text.strip()
+            except ImportError:
+                return "[Error: No PDF reader available. Install PyMuPDF or pdfplumber]"
         
-        if filename.endswith(".docx"):
+        # Word documents
+        if filename_lower.endswith((".docx", ".doc")):
             try:
                 from docx import Document
                 doc = Document(io.BytesIO(file_content))
-                text = "\n".join([para.text for para in doc.paragraphs])
+                text = "\n".join(para.text for para in doc.paragraphs)
                 return text.strip()
             except ImportError:
                 return "[Error: python-docx not installed]"
         
+        # Images (OCR)
         if mime_type and mime_type.startswith("image"):
             try:
                 image = Image.open(io.BytesIO(file_content))
                 text = pytesseract.image_to_string(image)
                 return text.strip()
             except Exception as e:
-                return f"[Error reading image: {str(e)}]"
+                return f"[Error reading image: {e}]"
         
         return f"[Unsupported file type: {mime_type or filename}]"
         
     except Exception as e:
-        logging.error(f"🔥 Error extracting text from file: {e}")
-        return f"[Error reading file: {str(e)}]"
+        logger.error(f"🔥 Error extracting text from {filename}: {e}")
+        return f"[Error reading file: {e}]"
 
 
-# ✅ UPDATED v2.5: ถาม LLM โดยตรง - ENGLISH ONLY
-def ask_llm_directly(llm, question: str, file_content: str = "", filename: str = "", 
-                     mode: str = "auto", chat_history: List[dict] = None,
-                     web_context: str = "") -> dict:
+# ============================================================================
+# LLM INTERACTION
+# ============================================================================
+
+def build_system_prompt() -> str:
+    """Build the system prompt for the PLC Assistant"""
+    return """You are a knowledgeable PLC & Industrial Automation Assistant.
+
+EXPERTISE AREAS:
+• PLC Programming: Ladder Logic, Structured Text, Function Block Diagram, Instruction List, Sequential Function Chart
+• Industrial Protocols: Modbus (RTU/TCP), PROFINET, EtherNet/IP, OPC UA, PROFIBUS, CANopen, BACnet
+• Automation Systems: SCADA, HMI, DCS, MES integration
+• Motion Control: Servo drives, VFDs, stepper motors, positioning
+• Safety Systems: Safety PLCs, emergency stops, light curtains, IEC 61508/62443
+• Troubleshooting: Diagnostic techniques, error analysis, preventive maintenance
+
+RESPONSE GUIDELINES:
+1. Always respond in English, regardless of the input language
+2. Be precise and technical when discussing automation topics
+3. Include relevant specifications, standards, or protocols when applicable
+4. Provide step-by-step guidance for troubleshooting questions
+5. Mention safety considerations where relevant
+6. If you don't know something, say so clearly"""
+
+
+def ask_llm_directly(
+    llm,
+    question: str,
+    file_content: str = "",
+    filename: str = "",
+    mode: str = "fast",
+    chat_history: List[Dict] = None,
+    web_context: str = ""
+) -> Dict[str, Any]:
     """
-    ส่งคำถามไป LLM โดยตรง - ตอบได้ทุกเรื่อง ไม่จำกัดแค่ PLCnext
-    ENGLISH ONLY OUTPUT
+    Send question directly to LLM without RAG.
+    Used for Fast mode responses.
     """
     start_time = time.perf_counter()
     
-    # Build chat history string
+    # Build conversation history
     history_str = ""
     if chat_history:
-        for msg in chat_history[-10:]:
+        for msg in chat_history[-10:]:  # Last 10 messages for context
             role = "User" if msg.get("sender") == "user" else "Assistant"
-            text = msg.get("text", "")[:500]
+            text = msg.get("text", "")[:500]  # Truncate long messages
             history_str += f"{role}: {text}\n"
     
-    # Handle file content
+    # Build file section
     file_section = ""
     if file_content:
-        original_length = len(file_content)
-        max_chars = DEEP_MODE_CHARS if mode == "deep" else FAST_MODE_CHARS
+        max_chars = config.DEEP_MODE_CHARS if mode == "deep" else config.FAST_MODE_CHARS
         truncated = len(file_content) > max_chars
-        if truncated:
-            file_content = file_content[:max_chars]
+        content = file_content[:max_chars] if truncated else file_content
         
         file_section = f"""
 === UPLOADED FILE: {filename} ===
-{file_content}
+{content}
 {"[... content truncated ...]" if truncated else ""}
-===
-"""
+==="""
     
-    # Web search section
+    # Build web search section
     web_section = ""
     if web_context:
         web_section = f"""
 === WEB SEARCH RESULTS ===
 {web_context}
-===
-"""
+==="""
     
-    # ✅ ENGLISH ONLY PROMPT
-    prompt = f"""You are Panya, a helpful AI assistant.
-
-LANGUAGE RULE: You must ALWAYS answer in English only. Even if the user asks in Thai, Chinese, Japanese, German, or any other language, you must respond in English. Never respond in any language other than English.
-
-IMPORTANT: PLCnext is made by Phoenix Contact (NOT Siemens, NOT Schneider Electric!).
+    # Build the prompt
+    system_prompt = build_system_prompt()
+    
+    prompt = f"""{system_prompt}
 
 {"=== CONVERSATION HISTORY ===" + chr(10) + history_str + "===" if history_str else ""}
-
 {file_section}
-
 {web_section}
 
-**User's Question:** {question}
+USER QUESTION: {question}
 
-**Instructions:**
-1. Answer the question thoroughly and helpfully IN ENGLISH
-2. If there is conversation history, use it to maintain context
-3. If there is file content, analyze and reference it
-4. If there are web search results, use them to provide accurate information
-5. Be detailed and informative - don't give short, unhelpful answers
-6. If asked about PLCnext/PLC details, say "Please use Deep mode for accurate PLCnext information"
-
-**Your answer in English:**"""
+Provide a helpful, detailed response in English:"""
 
     try:
         response = llm.invoke(prompt)
-        total_time = time.perf_counter() - start_time
+        elapsed = time.perf_counter() - start_time
         
         return {
             "reply": response,
-            "processing_time": total_time,
+            "processing_time": elapsed,
             "mode": mode
         }
     except Exception as e:
-        logging.error(f"🔥 Error asking LLM: {e}")
+        logger.error(f"🔥 LLM error: {e}")
         return {
-            "reply": f"Error: {str(e)}",
+            "reply": f"I encountered an error processing your request: {str(e)}",
             "processing_time": time.perf_counter() - start_time,
             "mode": mode
         }
 
 
-# ---- FastAPI Lifespan ----
+# ============================================================================
+# FASTAPI APPLICATION
+# ============================================================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logging.info("🚀 Starting application lifespan...")
-
-    if not test_database_connection():
-        logging.error("❌ Database test failed during startup!")
-        app.state.db_pool = None
-    else:
+    """Application lifespan manager - handles startup and shutdown"""
+    logger.info("🚀 Starting application...")
+    
+    # Initialize database pool
+    if test_database_connection():
         try:
             app.state.db_pool = pool.SimpleConnectionPool(
-                1, 10,
-                dsn=DB_URL,
+                config.DB_POOL_MIN,
+                config.DB_POOL_MAX,
+                dsn=config.DATABASE_URL,
                 keepalives=1,
                 keepalives_idle=30,
                 keepalives_interval=10,
                 keepalives_count=5
             )
-            logging.info("✅ Database connection pool created.")
+            logger.info("✅ Database connection pool created")
         except Exception as e:
-            logging.error(f"🔥 Failed to create database connection pool: {e}")
+            logger.error(f"🔥 Failed to create database pool: {e}")
             app.state.db_pool = None
-
+    else:
+        app.state.db_pool = None
+    
+    # Initialize LLM
     app.state.llm = None
-    app.state.embedder = None
-
-    if wait_for_ollama() and ensure_model(OLLAMA_MODEL):
+    if wait_for_ollama() and ensure_model(config.OLLAMA_MODEL):
         try:
             app.state.llm = OllamaLLM(
-                model=OLLAMA_MODEL,
-                base_url=OLLAMA_BASE_URL,
-                temperature=0.7,
-                timeout=180
+                model=config.OLLAMA_MODEL,
+                base_url=config.OLLAMA_BASE_URL,
+                temperature=config.LLM_TEMPERATURE,
+                timeout=config.LLM_TIMEOUT
             )
-            logging.info(f"✅ LLM ({OLLAMA_MODEL}) loaded.")
+            logger.info(f"✅ LLM loaded: {config.OLLAMA_MODEL}")
         except Exception as e:
-            logging.error(f"🔥 Failed to load LLM: {e}")
-
+            logger.error(f"🔥 Failed to load LLM: {e}")
+    
+    # Initialize embedder
+    app.state.embedder = None
     try:
         app.state.embedder = SentenceTransformer(
-            EMBED_MODEL_NAME,
+            config.EMBED_MODEL_NAME,
             cache_folder='/app/models'
         )
-        logging.info(f"✅ Embedder ({EMBED_MODEL_NAME}) loaded.")
+        logger.info(f"✅ Embedder loaded: {config.EMBED_MODEL_NAME}")
     except Exception as e:
-        logging.error(f"🔥 Failed to load embedder: {e}")
-
-    yield
-
+        logger.error(f"🔥 Failed to load embedder: {e}")
+    
+    logger.info("🎉 Application startup complete")
+    
+    yield  # Application runs here
+    
+    # Shutdown
+    logger.info("👋 Shutting down...")
     if hasattr(app.state, 'db_pool') and app.state.db_pool:
         app.state.db_pool.closeall()
-        logging.info("👋 Database connection pool closed.")
-    logging.info("👋 Shutting down application lifespan...")
+        logger.info("Database pool closed")
 
-# ---- App init ----
+
+# Create FastAPI app
 app = FastAPI(
     lifespan=lifespan,
-    title="PLCnext Chatbot v2.5",
-    description="General AI Assistant with RAG for PLCnext + Web Search (English Only)",
-    version="2.5.0"
+    title="PLC Assistant API",
+    description="""
+    Universal PLC & Industrial Automation Assistant with RAG capabilities.
+    
+    ## Modes
+    - **Fast**: Direct LLM response for general questions (~5-15s)
+    - **Deep**: RAG-powered response using documentation (~30-60s)
+    
+    ## Features
+    - Multi-file support (PDF, DOCX, images, etc.)
+    - Web search integration
+    - Chat history context
+    - Voice transcription
+    """,
+    version="3.0.0"
 )
 
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -438,52 +615,114 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# ---- Models ----
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
 class ChatRequest(BaseModel):
     message: str
-    collection: str = "plcnext"
+    collection: str = Field(default="plc_docs")
+
 
 class ChatResponse(BaseModel):
     reply: str
-    processing_time: float | None = None
-    retrieval_time: float | None = None
-    context_count: int | None = None
-    ragas: dict | None = None
+    processing_time: Optional[float] = None
+    retrieval_time: Optional[float] = None
+    context_count: Optional[int] = None
+    ragas: Optional[dict] = None
+
 
 class HealthResponse(BaseModel):
     status: str
     services: dict
     timestamp: str
+    version: str = "3.0.0"
 
-# ---- Endpoints ----
-@app.get("/health", response_model=HealthResponse)
+
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
+
+@app.get("/", tags=["Info"])
+def root():
+    """API information and documentation"""
+    return {
+        "name": "PLC Assistant API",
+        "version": "3.0.0",
+        "description": "Universal PLC & Industrial Automation Assistant",
+        "modes": {
+            "fast": {
+                "description": "Direct LLM response for general questions",
+                "response_time": "~5-15 seconds",
+                "use_for": ["General PLC concepts", "Quick troubleshooting", "Syntax help"]
+            },
+            "deep": {
+                "description": "RAG-powered response using embedded documentation",
+                "response_time": "~30-60 seconds",
+                "use_for": ["Specific documentation lookups", "Detailed specifications", "Accuracy-critical queries"]
+            }
+        },
+        "endpoints": {
+            "health": "GET /health",
+            "chat": "POST /api/chat",
+            "agent_chat": "POST /api/agent-chat",
+            "stream": "POST /api/chat/stream",
+            "transcribe": "POST /api/transcribe",
+            "collections": "GET /api/collections",
+            "stats": "GET /api/stats"
+        }
+    }
+
+
+@app.get("/health", response_model=HealthResponse, tags=["Health"])
 def health_check(request: Request):
-    services = {"database": False, "llm": False, "embedder": False}
+    """Check service health status"""
+    services = {
+        "database": False,
+        "llm": False,
+        "embedder": False
+    }
+    
+    # Check database
     try:
         if request.app.state.db_pool:
             conn = request.app.state.db_pool.getconn()
             request.app.state.db_pool.putconn(conn)
             services["database"] = True
-    except:
+    except Exception:
         pass
+    
+    # Check LLM and embedder
     services["llm"] = request.app.state.llm is not None
     services["embedder"] = request.app.state.embedder is not None
+    
     status = "healthy" if all(services.values()) else "degraded"
-    return HealthResponse(status=status, services=services, timestamp=time.strftime("%Y-%m-%d %H:%M:%S"))
+    
+    return HealthResponse(
+        status=status,
+        services=services,
+        timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
+    )
 
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(fastapi_request: Request, chat_request: ChatRequest):
-    db_pool = fastapi_request.app.state.db_pool
-    llm = fastapi_request.app.state.llm
-    embedder = fastapi_request.app.state.embedder
 
+@app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
+def chat(request: Request, chat_request: ChatRequest):
+    """
+    Simple chat endpoint using RAG pipeline.
+    For more control, use /api/agent-chat instead.
+    """
+    db_pool = request.app.state.db_pool
+    llm = request.app.state.llm
+    embedder = request.app.state.embedder
+    
     if not db_pool:
         raise HTTPException(status_code=503, detail="Database not available")
     if not llm:
         raise HTTPException(status_code=503, detail="LLM not available")
     if not embedder:
         raise HTTPException(status_code=503, detail="Embedder not available")
-
+    
     result = answer_question(
         question=chat_request.message,
         db_pool=db_pool,
@@ -493,18 +732,23 @@ def chat(fastapi_request: Request, chat_request: ChatRequest):
         retriever_class=PostgresVectorRetriever,
         reranker_class=EnhancedFlashrankRerankRetriever,
     )
-    return ChatResponse(**result)
+    
+    return ChatResponse(**sanitize_json(result))
 
 
-@app.post("/api/chat/stream")
-def chat_stream(fastapi_request: Request, chat_request: ChatRequest):
-    db_pool = fastapi_request.app.state.db_pool
-    llm = fastapi_request.app.state.llm
-    embedder = fastapi_request.app.state.embedder
-
+@app.post("/api/chat/stream", tags=["Chat"])
+def chat_stream(request: Request, chat_request: ChatRequest):
+    """Streaming chat endpoint for real-time responses"""
+    db_pool = request.app.state.db_pool
+    llm = request.app.state.llm
+    embedder = request.app.state.embedder
+    
     if not all([db_pool, llm, embedder]):
-        return {"error": "Services not ready"}
-
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Services not ready"}
+        )
+    
     def generate():
         yield from answer_question_stream(
             question=chat_request.message,
@@ -515,37 +759,7 @@ def chat_stream(fastapi_request: Request, chat_request: ChatRequest):
             retriever_class=PostgresVectorRetriever,
             reranker_class=EnhancedFlashrankRerankRetriever
         )
-
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"
-        }
-    )
-
-@app.get("/api/chat/stream")
-def chat_stream_get(message: str, collection: str = "plcnext", request: Request = None):
-    db_pool = request.app.state.db_pool
-    llm = request.app.state.llm
-    embedder = request.app.state.embedder
-
-    if not all([db_pool, llm, embedder]):
-        return {"error": "Services not ready"}
-
-    def generate():
-        yield from answer_question_stream(
-            question=message,
-            db_pool=db_pool,
-            llm=llm,
-            embedder=embedder,
-            collection=collection,
-            retriever_class=PostgresVectorRetriever,
-            reranker_class=EnhancedFlashrankRerankRetriever
-        )
-
+    
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
@@ -557,92 +771,71 @@ def chat_stream_get(message: str, collection: str = "plcnext", request: Request 
     )
 
 
-# ✅ agent-chat v2.5 - ENGLISH ONLY
-@app.post("/api/agent-chat")
+@app.post("/api/agent-chat", tags=["Chat"])
 def agent_chat(
     message: str = Form(""),
     file: UploadFile = File(None),
-    mode: str = Form("auto"),
+    mode: str = Form("fast"),
     chat_history: str = Form("[]"),
     log_eval: bool = Form(False),
     enable_ragas: bool = Form(False),
-    fast_ragas: bool | None = Form(None),
+    fast_ragas: Optional[bool] = Form(None),
     ground_truth: str = Form(""),
     use_rerank: Any = Form(None),
     use_rank: Any = Form(None),
 ):
+    """
+    Advanced chat endpoint with mode selection and file support.
+    
+    Parameters:
+    - message: The user's question
+    - file: Optional file upload (PDF, images, etc.)
+    - mode: Response mode - "fast" or "deep"
+    - chat_history: JSON array of previous messages for context
+    """
     start_time = time.perf_counter()
     
     # Parse chat history
     try:
         history = json.loads(chat_history) if chat_history else []
-    except:
+    except json.JSONDecodeError:
         history = []
     
-    # Validate mode
-    if mode not in ["auto", "fast", "deep"]:
-        mode = "auto"
+    # Validate mode - only "fast" and "deep" allowed
+    if mode not in ["fast", "deep"]:
+        mode = "fast"
     
-    # เก็บ original mode ไว้แสดงผล
-    display_mode = mode
+    logger.info(f"🎯 Request received - Mode: {mode}, Message: {message[:50]}...")
     
-    # ตัดสินใจ internal mode
-    internal_mode = mode
+    # Process uploaded file
     file_text = ""
-    file_content_bytes = None
-    mime_type = None
-    
     if file:
-        file_content_bytes = file.file.read()
+        file_content = file.file.read()
         mime_type, _ = mimetypes.guess_type(file.filename)
         
+        # Redirect audio files to transcription endpoint
         if mime_type and mime_type.startswith("audio"):
-            return {"error": "Please use /api/transcribe for audio files"}
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Please use /api/transcribe for audio files"}
+            )
         
-        file_text = extract_text_from_file(file_content_bytes, file.filename, mime_type)
-        logging.info(f"📄 Extracted {len(file_text)} characters from {file.filename}")
-        
-        if mode == "auto":
-            if len(file_text) > AUTO_THRESHOLD:
-                internal_mode = "fast"
-            else:
-                internal_mode = "deep"
-    else:
-        if mode == "auto":
-            # ถ้าเกี่ยวกับ PLCnext → Deep (RAG)
-            # ถ้าไม่ → Fast (LLM + web search ถ้าจำเป็น)
-            if is_plcnext_specific_question(message):
-                internal_mode = "deep"
-            else:
-                internal_mode = "fast"
+        file_text = extract_text_from_file(file_content, file.filename, mime_type)
+        logger.info(f"📄 Extracted {len(file_text)} chars from {file.filename}")
     
-    logging.info(f"🎯 Mode: {display_mode} (internal: {internal_mode})")
-    
-    # ====================================
-    # 🚀 FAST MODE - ENGLISH ONLY
-    # ====================================
-    if internal_mode == "fast":
-        # ลอง search เว็บก่อนถ้าไม่ใช่คำถามทั่วไป
+    # ========================================
+    # FAST MODE - Direct LLM
+    # ========================================
+    if mode == "fast":
+        # Determine if web search would be helpful
         web_context = ""
+        search_triggers = [
+            "latest", "current", "today", "news", "price",
+            "2024", "2025", "update", "release", "announce"
+        ]
         
-        # ตรวจสอบว่าควร search หรือไม่
-        should_search = any([
-            "netflix" in message.lower(),
-            "google" in message.lower(),
-            "facebook" in message.lower(),
-            "amazon" in message.lower(),
-            "microsoft" in message.lower(),
-            "apple" in message.lower(),
-            "company" in message.lower(),
-            "price" in message.lower(),
-            "news" in message.lower(),
-            "latest" in message.lower(),
-            "2024" in message.lower(),
-            "2025" in message.lower(),
-        ])
-        
-        if should_search:
-            logging.info(f"🌐 Searching web for: {message[:50]}...")
+        if any(trigger in message.lower() for trigger in search_triggers):
+            logger.info(f"🌐 Performing web search for: {message[:50]}...")
             web_context = web_search(message)
         
         result = ask_llm_directly(
@@ -650,64 +843,56 @@ def agent_chat(
             question=message,
             file_content=file_text,
             filename=file.filename if file else "",
-            mode=display_mode,
+            mode=mode,
             chat_history=history,
             web_context=web_context
         )
         
-        total_time = time.perf_counter() - start_time
-        
         response = {
             "reply": result.get("reply", ""),
-            "processing_time": total_time,
+            "processing_time": time.perf_counter() - start_time,
             "retrieval_time": 0,
             "context_count": 0,
             "contexts": [],
-            "eval": None,
-            "ragas": None,
-            "use_rerank": False,
-            "file_processed": file.filename if file else None,
-            "mode": display_mode,
-            "web_searched": bool(web_context)
+            "mode": mode,
+            "web_searched": bool(web_context),
+            "file_processed": file.filename if file else None
         }
-        return sanitize_json(response)
+        
+        return JSONResponse(content=sanitize_json(response))
     
-    # ====================================
-    # 🔍 DEEP MODE - RAG สำหรับ PLCnext
-    # ====================================
-    parsed_rerank = _to_bool(use_rerank)
-    parsed_alias = _to_bool(use_rank)
-    decided = parsed_rerank if parsed_rerank is not None else parsed_alias
-    if decided is None:
-        decided = os.getenv("USE_RERANK_DEFAULT", "true").strip().lower() in ("1","true","yes","y","on")
-    use_rerank_flag = decided
-    reranker_cls = EnhancedFlashrankRerankRetriever if use_rerank_flag else NoRerankRetriever
+    # ========================================
+    # DEEP MODE - RAG Pipeline
+    # ========================================
     
-    # รวม chat history
+    # Determine reranking strategy
+    parsed_rerank = to_bool(use_rerank) or to_bool(use_rank)
+    if parsed_rerank is None:
+        parsed_rerank = os.getenv("USE_RERANK_DEFAULT", "true").lower() in ("1", "true", "yes")
+    
+    reranker_cls = EnhancedFlashrankRerankRetriever if parsed_rerank else NoRerankRetriever
+    
+    # Build context from history
     history_context = ""
     if history:
-        recent_history = history[-6:]
-        for msg in recent_history:
+        for msg in history[-6:]:
             role = "User" if msg.get("sender") == "user" else "Assistant"
             history_context += f"{role}: {msg.get('text', '')[:200]}\n"
     
-    # แยก retrieval query กับ LLM context
+    # Prepare query
     retrieval_query = message
-    llm_context = message
-    if history_context:
-        llm_context = f"[Previous conversation]\n{history_context}\n[Current question]\n{message}"
-    
     if file_text:
-        truncated_file_text = file_text[:DEEP_MODE_CHARS] if len(file_text) > DEEP_MODE_CHARS else file_text
-        retrieval_query = f"{message}\n\n--- File Content ({file.filename}) ---\n{truncated_file_text}"
-        llm_context = f"{llm_context}\n\n--- File Content ({file.filename}) ---\n{truncated_file_text}"
-
+        max_chars = config.DEEP_MODE_CHARS
+        truncated = file_text[:max_chars] if len(file_text) > max_chars else file_text
+        retrieval_query = f"{message}\n\n--- File Content ({file.filename}) ---\n{truncated}"
+    
+    # Execute RAG pipeline
     result = answer_question(
         question=retrieval_query,
         db_pool=app.state.db_pool,
         llm=app.state.llm,
         embedder=app.state.embedder,
-        collection="plcnext",
+        collection=config.DEFAULT_COLLECTION,
         retriever_class=PostgresVectorRetriever,
         reranker_class=reranker_cls,
     )
@@ -715,155 +900,158 @@ def agent_chat(
     contexts = result.get("contexts_list") or result.get("contexts") or []
     reply_text = result.get("llm_answer", "") or result.get("reply", "")
     
-    # Fallback ถ้าไม่เจอข้อมูล
-    if "I could not find relevant information" in reply_text or not reply_text.strip():
-        logging.info(f"⚠️ Deep Mode: No context found, using general LLM...")
-        
-        # ใช้ LLM โดยตรง
+    # Fallback if no relevant context found
+    if "could not find relevant" in reply_text.lower() or not reply_text.strip():
+        logger.info("⚠️ No relevant context in Deep mode, falling back to direct LLM")
         result = ask_llm_directly(
             llm=app.state.llm,
             question=message,
             file_content=file_text,
             filename=file.filename if file else "",
-            mode=display_mode,
-            chat_history=history,
-            web_context=""
+            mode=mode,
+            chat_history=history
         )
         reply_text = result.get("reply", "")
     
     total_time = time.perf_counter() - start_time
-    logging.info(f"📊 Deep Mode: Time: {total_time:.2f}s")
-
+    logger.info(f"📊 Deep mode completed in {total_time:.2f}s")
+    
     response = {
         "reply": reply_text,
-        "processing_time": result.get("processing_time", total_time),
-        "retrieval_time": result.get("retrieval_time", None),
-        "context_count": result.get("context_count", None),
+        "processing_time": total_time,
+        "retrieval_time": result.get("retrieval_time"),
+        "context_count": result.get("context_count"),
         "contexts": contexts,
-        "eval": None,
-        "ragas": None,
-        "use_rerank": use_rerank_flag,
-        "file_processed": file.filename if file else None,
-        "mode": display_mode
+        "mode": mode,
+        "use_rerank": parsed_rerank,
+        "file_processed": file.filename if file else None
     }
-    return sanitize_json(response)
+    
+    return JSONResponse(content=sanitize_json(response))
 
 
-@app.get("/api/collections")
-def get_collections(request: Request):
-    try:
-        db_pool = request.app.state.db_pool
-        if not db_pool:
-            raise HTTPException(status_code=503, detail="Database not available")
-        conn = db_pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT collection FROM documents ORDER BY collection;")
-                collections = [row[0] for row in cur.fetchall()]
-            return {"collections": collections}
-        finally:
-            db_pool.putconn(conn)
-    except Exception as e:
-        logging.error(f"🔥 Error fetching collections: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/stats")
-def get_stats(request: Request):
-    try:
-        db_pool = request.app.state.db_pool
-        if not db_pool:
-            raise HTTPException(status_code=503, detail="Database not available")
-        conn = db_pool.getconn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT 
-                        collection,
-                        COUNT(*) as doc_count,
-                        AVG(LENGTH(content)) as avg_content_length
-                    FROM documents 
-                    GROUP BY collection
-                    ORDER BY collection;
-                """)
-                stats = []
-                for row in cur.fetchall():
-                    stats.append({
-                        "collection": row[0],
-                        "document_count": row[1],
-                        "avg_content_length": round(row[2], 2) if row[2] else 0
-                    })
-            return {"statistics": stats}
-        finally:
-            db_pool.putconn(conn)
-    except Exception as e:
-        logging.error(f"🔥 Error fetching stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/")
-def root():
-    return {
-        "message": "PLCnext Chatbot API v2.5 - English Only Output",
-        "features": [
-            "Answer ANY topic (not just PLCnext)",
-            "Chat History Support",
-            "Web Search for current information", 
-            "RAG for PLCnext documentation",
-            "English-only output"
-        ],
-        "endpoints": {
-            "health": "/health",
-            "chat": "/api/chat",
-            "agent_chat": "/api/agent-chat",
-            "collections": "/api/collections",
-            "stats": "/api/stats"
-        },
-        "modes": {
-            "auto": "Smart: PLCnext -> RAG, Others -> LLM + Web Search",
-            "fast": "Direct LLM with web search (~5-15s)",
-            "deep": "RAG for PLCnext docs (~30-60s)"
-        }
-    }
-
-@app.post("/api/transcribe")
+@app.post("/api/transcribe", tags=["Audio"])
 def transcribe(file: UploadFile = File(...)):
+    """Transcribe audio file to text using Whisper"""
     import tempfile
-    from faster_whisper import WhisperModel
-
+    
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        raise HTTPException(
+            status_code=503, 
+            detail="Whisper not available. Install faster-whisper."
+        )
+    
+    # Save to temp file
     suffix = "." + file.filename.split('.')[-1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file.file.read()) 
+        tmp.write(file.file.read())
         tmp_path = tmp.name
+    
+    try:
+        model = WhisperModel("small.en", device="cpu", compute_type="float32")
+        segments, _ = model.transcribe(tmp_path, language="en", beam_size=1)
+        transcript = "".join(s.text for s in segments)
+        return {"text": transcript.strip()}
+    finally:
+        # Cleanup temp file
+        import os
+        os.unlink(tmp_path)
 
-    model = WhisperModel("small.en", device="cpu", compute_type="float32")
-    segments, _ = model.transcribe(tmp_path, language="en", beam_size=1)
-    transcript = "".join([s.text for s in segments])
-    return {"text": transcript}
 
-@app.post("/api/chat-image", response_model=ChatResponse)
+@app.post("/api/chat-image", response_model=ChatResponse, tags=["Chat"])
 def chat_image(
     request: Request,
     file: UploadFile = File(...),
     message: str = Form("")
 ):
+    """Chat with an image using OCR"""
     image_bytes = file.file.read()
     image = Image.open(io.BytesIO(image_bytes))
     ocr_text = pytesseract.image_to_string(image)
-
-    final_question = ((message or "") + "\n" + ocr_text).strip()
-    db_pool = request.app.state.db_pool
-    llm = request.app.state.llm
-    embedder = request.app.state.embedder
+    
+    combined_question = f"{message}\n\n[Image OCR Text]:\n{ocr_text}".strip()
+    
     result = answer_question(
-        question=final_question,
-        db_pool=db_pool,
-        llm=llm,
-        embedder=embedder,
-        collection="plcnext",
+        question=combined_question,
+        db_pool=request.app.state.db_pool,
+        llm=request.app.state.llm,
+        embedder=request.app.state.embedder,
+        collection=config.DEFAULT_COLLECTION,
         retriever_class=PostgresVectorRetriever,
         reranker_class=EnhancedFlashrankRerankRetriever,
     )
-    return ChatResponse(**result)
+    
+    return ChatResponse(**sanitize_json(result))
+
+
+@app.get("/api/collections", tags=["Data"])
+def get_collections(request: Request):
+    """List available document collections"""
+    db_pool = request.app.state.db_pool
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT collection 
+                FROM documents 
+                ORDER BY collection;
+            """)
+            collections = [row[0] for row in cur.fetchall()]
+        return {"collections": collections}
+    finally:
+        db_pool.putconn(conn)
+
+
+@app.get("/api/stats", tags=["Data"])
+def get_stats(request: Request):
+    """Get document statistics"""
+    db_pool = request.app.state.db_pool
+    if not db_pool:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    collection,
+                    COUNT(*) as document_count,
+                    ROUND(AVG(LENGTH(content))::numeric, 2) as avg_content_length,
+                    MIN(LENGTH(content)) as min_content_length,
+                    MAX(LENGTH(content)) as max_content_length
+                FROM documents 
+                GROUP BY collection
+                ORDER BY collection;
+            """)
+            stats = []
+            for row in cur.fetchall():
+                stats.append({
+                    "collection": row[0],
+                    "document_count": row[1],
+                    "avg_content_length": float(row[2]) if row[2] else 0,
+                    "min_content_length": row[3],
+                    "max_content_length": row[4]
+                })
+        return {"statistics": stats}
+    finally:
+        db_pool.putconn(conn)
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=5000,
+        reload=False,
+        workers=1
+    )
