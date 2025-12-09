@@ -162,7 +162,13 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
         # ✅ จำกัดจำนวนที่ส่งเข้า Flashrank เพื่อความไว/เสถียร
         cap = _env_int("RERANK_CANDIDATES_MAX", 32)
         ranked = self._rank(query, cand[:cap])
-        return [d for _, d in ranked[: self.top_n]]
+        
+        # Store score in metadata
+        results = []
+        for score, doc in ranked[:self.top_n]:
+            doc.metadata["score"] = score
+            results.append(doc)
+        return results
 
 
 # ===============================
