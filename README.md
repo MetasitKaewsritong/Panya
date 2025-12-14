@@ -1,6 +1,6 @@
-# Smart Assistant for PLCnext (แชทบอท PLCnext)
+# PLC Assistant
 
-โปรเจกต์นี้คือระบบผู้ช่วยอัจฉริยะ (Chatbot) สำหรับตอบคำถามทางเทคนิคที่เกี่ยวข้องกับ **PLCn**
+โปรเจกต์นี้คือระบบผู้ช่วยอัจฉริยะ (Chatbot) สำหรับตอบคำถามทางเทคนิคที่เกี่ยวข้องกับ **PLC**
 โดยใช้สถาปัตยกรรม **RAG (Retrieval-Augmented Generation)**
 
 แชทบอทนี้ถูกออกแบบมาเพื่อลดเวลาในการค้นหาข้อมูลในคู่มือที่ซับซ้อน ช่วยให้วิศวกรและช่างเทคนิคสามารถแก้ไขปัญหาและรับคำแนะนำได้รวดเร็วขึ้น
@@ -17,14 +17,14 @@
     * **เสียง:** MP3, WAV, M4A, WebM (ใช้ Whisper แปลงเป็นข้อความ)
     * **เอกสาร:** PDF, TXT, CSV, JSON, DOCX
 * **GPU Acceleration:** รองรับ NVIDIA GPU เพื่อเพิ่มความเร็วในการประมวลผล
-* **Local LLM:** ทำงานแบบ Offline-first โดยใช้ `LLaMA 3` ผ่าน `Ollama` ทำให้ข้อมูลปลอดภัยและไม่ต้องเชื่อมต่ออินเทอร์เน็ต
+* **Local LLM:** ทำงานแบบ Offline-first โดยใช้ LLaMA 3 ผ่าน Ollama ทำให้ข้อมูลปลอดภัยและไม่ต้องเชื่อมต่ออินเทอร์เน็ต
 * **Web Interface:** หน้าตาแชทที่ใช้งานง่าย สร้างด้วย React
 
 ## 🛠️ เทคโนโลยีที่ใช้ (Tech Stack)
 
 * **Frontend:** React (Vite)
 * **Backend:** FastAPI (Python)
-* **Database:** PostgreSQL + `pgvector` (สำหรับ Vector Storage)
+* **Database:** PostgreSQL + pgvector (สำหรับ Vector Storage)
 * **Orchestration/AI:** LangChain
 * **LLM Service:** Ollama (LLaMA 3)
 * **Deployment:** Docker Compose
@@ -55,7 +55,7 @@
 โปรเจกต์นี้ต้องใช้ไฟล์ `.env` ในการกำหนดค่า Backend
 
 1.  **สร้างไฟล์ `.env`:**
-    ในโปรเจกต์จะมีไฟล์ `backend/.env.example` (ไฟล์ตัวอย่างที่ปลอดภัย)
+    ในโปรเจกต์จะมีไฟล์ `.env.example` (ไฟล์ตัวอย่างที่ปลอดภัย)
     
     คัดลอกไฟล์ตัวอย่างนี้เพื่อสร้างไฟล์ `.env` ที่ระบบจะใช้จริง (ไฟล์นี้จะถูก `.gitignore` ซ่อนไว้):
     ```bash
@@ -64,7 +64,7 @@
 
 2.  **แก้ไข (ถ้าจำเป็น):**
     * โดยทั่วไป คุณสามารถใช้ค่าเริ่มต้นในไฟล์ `.env` ได้เลย
-    * **ยกเว้น** หากคุณต้องการใช้ **OpenAI API** (ซึ่งไม่บังคับ) คุณต้องไปแก้ไขไฟล์ `.env` แล้วกรอก `OPENAI_API_KEY` ของคุณเอง **(ห้ามแชร์คีย์นี้ให้ใครเด็ดขาด!)**
+    * **ยกเว้น** หากคุณต้องการใช้ **OpenAI API** (ซึ่งไม่บังคับ) คุณต้องไปแก้ไขไฟล์ `.env` แล้วกรอก OPENAI_API_KEY ของคุณเอง **(ห้ามแชร์คีย์นี้ให้ใครเด็ดขาด!)**
 
 ### 4. 🧠 (สำคัญ!) การเตรียมโมเดล LLM
 
@@ -76,7 +76,7 @@
     ```
 
 2.  **ดึงโมเดล (Pull Models):**
-    รัน 2 คำสั่งนี้เพื่อดึงโมเดลหลัก (`llama3.2`) และโมเดลสำหรับประเมินผล (`phi3:mini`):
+    รัน 2 คำสั่งนี้เพื่อดึงโมเดลหลัก (llama3.2) และโมเดลสำหรับประเมินผล (phi3:mini):
 
     ```bash
     docker compose exec ollama ollama pull llama3.2
@@ -92,13 +92,13 @@
     ```bash
     docker compose up -d postgres
     ```
-    *(คำสั่งนี้จะสร้าง Container ชื่อ `postgres` และรอให้มันทำงาน)*
+    *(คำสั่งนี้จะสร้าง Container ชื่อ postgres และรอให้มันทำงาน)*
 
 2.  **นำเข้าข้อมูล (Restore):**
     ```bash
     docker compose exec -T postgres psql -U user plcnextdb < backup.sql
     ```
-    *(คำสั่งนี้จะนำข้อมูลจาก `backup.sql` เข้าไปในฐานข้อมูล `plcnextdb` ที่กำลังรันอยู่)*
+    *(คำสั่งนี้จะนำข้อมูลจาก `backup.sql` เข้าไปในฐานข้อมูล plcnextdb ที่กำลังรันอยู่)*
 
 ### 6. 🚀 การรันโปรเจกต์ (Running the Project)
 
@@ -108,9 +108,9 @@
     ```bash
     docker compose up --build
     ```
-    *(คำสั่งนี้จะสร้าง (build) Image ของ `frontend` และ `backend` และสตาร์ทบริการทั้งหมด: `frontend`, `backend`, `postgres`, และ `ollama`)*
+    *(คำสั่งนี้จะสร้าง (build) Image ของ frontend และ backend และสตาร์ทบริการทั้งหมด: frontend, backend, postgres, และ ollama)*
 
-2.  **รอจนระบบพร้อม:** รอจน Log ใน Terminal แสดงว่าทุกบริการทำงาน (running) โดยเฉพาะ `frontend` และ `backend`
+2.  **รอจนระบบพร้อม:** รอจน Log ใน Terminal แสดงว่าทุกบริการทำงาน (running) โดยเฉพาะ frontend และ backend
 
 3.  **เข้าใช้งาน:**
     เปิดเบราว์เซอร์แล้วไปที่: **http://localhost:5173**
@@ -131,7 +131,7 @@ docker run --rm --gpus all nvidia/cuda:12.0.0-base-ubuntu22.04 nvidia-smi
 
 #### ขั้นตอนที่ 2: แก้ไข docker-compose.yml
 
-เพิ่มส่วน `deploy` ใน service `ollama`:
+เพิ่มส่วน deploy ใน service: ollama:
 
 ```yaml
 services:
@@ -196,7 +196,7 @@ docker compose logs ollama | grep -i gpu
 1.  **วางไฟล์ของคุณ:** นำไฟล์ (เช่น `my_manual.pdf`) ไปวางในโฟลเดอร์ใดก็ได้ในเครื่องของคุณ (เช่น `D:/MyData/PDFs`)
 
 2.  **แก้ไขไฟล์ `docker-compose.yml`:**
-    เปิดไฟล์ `docker-compose.yml` ขึ้นมา ค้นหาส่วนของ `backend:` และเพิ่ม `volumes:` (Path) ของคุณลงไป
+    เปิดไฟล์ `docker-compose.yml` ขึ้นมา ค้นหาส่วนของ backend: และเพิ่ม volumes: (Path) ของคุณลงไป
 
     **ตัวอย่าง:**
     ```yaml
@@ -225,7 +225,7 @@ docker compose logs ollama | grep -i gpu
 
 ### 7.2 รันคำสั่ง Embedding
 
-ใช้ Path **ภายใน Docker** ที่คุณตั้งไว้ใน `volumes` (เช่น `/app/data/custom_pdfs`)
+ใช้ Path **ภายใน Docker** ที่คุณตั้งไว้ใน volumes (เช่น `/app/data/custom_pdfs`)
 
 ```bash
 # ตัวอย่าง: รัน embed ไฟล์ my_manual.pdf ที่อยู่ใน D:/MyData/PDFs
@@ -271,11 +271,11 @@ docker compose exec backend bash
 
 ### Q: ทำไมตอบช้ามาก?
 **A:** 
-1. ตรวจสอบว่าปิด RAGAS แล้วหรือยัง (ใน `.env` ตั้ง `EVAL_WITH_RAGAS=false`)
+1. ตรวจสอบว่าปิด RAGAS แล้วหรือยัง (ใน `.env` ตั้ง EVAL_WITH_RAGAS=false)
 2. ถ้ามี NVIDIA GPU ให้เปิดใช้งานตามคู่มือด้านบน
 
 ### Q: Upload ไฟล์ PDF แล้ว error?
-**A:** ตรวจสอบว่าติดตั้ง `PyMuPDF` ใน `requirements.txt` แล้ว และ rebuild ด้วย `docker compose up -d --build`
+**A:** ตรวจสอบว่าติดตั้ง PyMuPDF ใน `requirements.txt` แล้ว และ rebuild ด้วย `docker compose up -d --build`
 
 ---
 
