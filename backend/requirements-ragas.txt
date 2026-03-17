@@ -1,0 +1,9 @@
+# Optional dependencies for offline RAGAS evaluation only.
+# Runtime chatbot does not require these packages.
+
+ragas==0.2.10
+datasets>=2.19.0
+pandas>=2.1
+langchain-huggingface>=0.1.0
+scikit-learn>=1.4
+

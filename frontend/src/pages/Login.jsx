@@ -45,7 +45,7 @@ function Login({ onLogin, onGoRegister }) {
           </h2>
 
           {error && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-xl text-red-600 text-sm text-center">
+            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-xl text-red-600 text-sm text-center break-words">
               {error}
             </div>
           )}

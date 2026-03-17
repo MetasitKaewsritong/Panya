@@ -15,16 +15,18 @@ import {
   Menu,
   Mic,
   MicOff,
+  Ear,
   Pin,
   Search,
   X,
   Copy,
   Check,
-  CornerDownLeft
+  CornerDownLeft,
+  StopCircle
 } from "lucide-react";
 
 // Centralized API and hooks
-import api, { authAPI, chatAPI } from "../utils/api";
+import api from "../utils/api";
 import { useVoiceRecording } from "../hooks/useVoiceRecording";
 
 /* ================= HELPER FUNCTIONS ================= */
@@ -53,67 +55,139 @@ const formatTime = (timestamp) => {
 };
 
 /**
- * Convert markdown tables (including inline/malformed ones) to bullet points.
- * This directly transforms table content to bullet format, bypassing
- * ReactMarkdown table rendering for more reliable output.
- * 
- * NOTE: Backend (chatbot.py) also has fix_markdown_tables() that runs first.
- * This frontend version serves as a fallback for edge cases.
+ * Clean up malformed inline tables by converting them to proper markdown format.
+ * This handles cases where tables are on a single line.
  */
 const fixMarkdownTable = (text) => {
   if (!text || !text.includes('|')) return text;
 
   const lines = text.split('\n');
   const fixedLines = [];
-
+  
   for (const line of lines) {
-    // Check if line contains table-like content (multiple | chars)
-    const pipeCount = (line.match(/\|/g) || []).length;
-
-    if (pipeCount >= 4) {
-      // Split by | and get non-empty, non-separator parts
-      const parts = line.split('|')
-        .map(p => p.trim())
-        .filter(p => p !== '' && !/^-+$/.test(p)); // Remove empty and separator cells
-
-      if (parts.length >= 2) {
-        // Check if this looks like a header row (Term, Description, etc)
-        const isHeader = parts.every(p =>
-          p.length < 30 && /^[A-Z][a-zA-Z\s()]*$/.test(p)
-        );
-
-        if (isHeader) {
-          // Skip header row, we'll use content as bullet labels
-          continue;
-        }
-
-        // Convert data cells to bullet points
-        // Each non-empty cell becomes a bullet point
-        const bullets = [];
-        for (const part of parts) {
-          if (part.length > 5) { // Skip very short cells
-            // Check if it's "Term: Description" format
-            const colonPos = part.indexOf(':');
-            if (colonPos > 0 && colonPos < 50) {
-              const term = part.substring(0, colonPos).trim();
-              const desc = part.substring(colonPos + 1).trim();
-              bullets.push(`• **${term}**: ${desc}`);
-            } else {
-              bullets.push(`• ${part}`);
+    // Check if this is an inline table (has separator pattern inline)
+    // Pattern: | text | text | | --- | --- | | text | text |
+    if (line.includes('| ---') && line.split('|').length > 8) {
+      // This looks like an inline table, try to split it properly
+      const parts = line.split('|').map(p => p.trim()).filter(p => p);
+      
+      // Find separator indices (cells that are just dashes)
+      const sepIndices = [];
+      parts.forEach((p, i) => {
+        if (/^-+$/.test(p)) sepIndices.push(i);
+      });
+      
+      if (sepIndices.length > 0) {
+        const numCols = sepIndices[0];
+        
+        if (numCols > 0) {
+          // Build proper table rows
+          const rows = [];
+          for (let i = 0; i < parts.length; i += numCols) {
+            const rowParts = parts.slice(i, i + numCols);
+            if (rowParts.length === numCols) {
+              rows.push('| ' + rowParts.join(' | ') + ' |');
             }
           }
-        }
-
-        if (bullets.length > 0) {
-          fixedLines.push(bullets.join('\n'));
-          continue;
+          
+          if (rows.length > 0) {
+            fixedLines.push(rows.join('\n'));
+            continue;
+          }
         }
       }
     }
+    
     fixedLines.push(line);
   }
-
+  
   return fixedLines.join('\n');
+};
+
+const stripQualityMetrics = (text) => {
+  if (!text) return text;
+
+  const lines = String(text).split('\n');
+  const result = [];
+  let skipSection = false;
+
+  const isHorizontalRule = (line) => {
+    const trimmed = line.trim();
+    return trimmed === '---' || trimmed === '***' || trimmed === '___';
+  };
+
+  const markers = [
+    'response quality metrics',
+    '📊 response quality metrics',
+    'overall quality',
+    'answer relevancy',
+    'faithfulness',
+    'context precision',
+    'context recall',
+    'referenced documents',
+    '📚 referenced documents'
+  ];
+
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+
+    if (markers.some(marker => lower.includes(marker))) {
+      // Remove a divider just before the metrics block
+      if (result.length > 0 && isHorizontalRule(result[result.length - 1])) {
+        result.pop();
+      }
+      skipSection = true;
+      continue;
+    }
+
+    if (skipSection) {
+      const isMetricLine = markers.some(marker => lower.includes(marker))
+        || lower.includes('%')
+        || lower.includes('.pdf')
+        || lower.includes('pages')
+        || line.trim().startsWith('•')
+        || line.trim().startsWith('-')
+        || isHorizontalRule(line);
+
+      if (isMetricLine || line.trim() === '') {
+        continue;
+      }
+
+      skipSection = false;
+    }
+
+    result.push(line);
+  }
+
+  return result.join('\n');
+};
+
+const RAGAS_METRIC_KEYS = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"];
+const RAGAS_METRIC_LABELS = {
+  faithfulness: "Faithfulness",
+  answer_relevancy: "Answer Relevancy",
+  context_precision: "Context Precision",
+  context_recall: "Context Recall",
+};
+
+const formatRagasMetric = (value) => {
+  if (value === null || value === undefined) return "N/A";
+  const num = Number(value);
+  if (Number.isNaN(num)) return "N/A";
+  return `${(num * 100).toFixed(1)}%`;
+};
+
+const formatResponseMode = (mode) => {
+  const value = String(mode || "").toLowerCase();
+  if (value === "vision") return "Vision";
+  if (value === "text") return "Text";
+  return null;
+};
+
+const shouldShowVisionFallback = (message) => {
+  const requested = String(message?.requestedMode || "").toLowerCase();
+  const response = String(message?.responseMode || "").toLowerCase();
+  return requested === "vision" && response !== "vision" && Boolean(message?.modeFallbackReason);
 };
 
 
@@ -146,9 +220,18 @@ function Chat({ onLogout }) {
   // Pagination state
   const [chatPagination, setChatPagination] = useState({}); // { sessionId: { hasMore, total, offset } }
   const [loadingMore, setLoadingMore] = useState(false);
+  const [useVisionMode, setUseVisionMode] = useState(() => {
+    const stored = localStorage.getItem("chat_use_vision_mode");
+    return stored === "true";
+  });
 
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
+  const abortControllerRef = useRef(null);
+
+  useEffect(() => {
+    localStorage.setItem("chat_use_vision_mode", String(useVisionMode));
+  }, [useVisionMode]);
 
   // Voice recording hook
   const {
@@ -159,7 +242,8 @@ function Chat({ onLogout }) {
     cancelTranscription
   } = useVoiceRecording((text) => {
     setInput(prev => prev + (prev ? ' ' : '') + text);
-    inputRef.current?.focus();
+    // Delay focus until after React re-renders with isTranscribing=false
+    setTimeout(() => inputRef.current?.focus(), 50);
   });
 
   // Copy to clipboard function
@@ -207,9 +291,9 @@ function Chat({ onLogout }) {
           updated_at: s.updated_at || s.created_at,
         }));
         setChatHistory(sessions);
-        // If no active chat and sessions exist, select the first one
-        if (sessions.length > 0 && !activeChatId) {
-          setActiveChatId(sessions[0].id);
+        // If no active chat and sessions exist, select the first one.
+        if (sessions.length > 0) {
+          setActiveChatId(prev => prev ?? sessions[0].id);
         }
       })
       .catch(console.error);
@@ -229,7 +313,11 @@ function Chat({ onLogout }) {
           sender: m.role === "user" ? "user" : "bot",
           timestamp: m.created_at,
           processingTime: m.metadata?.processing_time,
-          ragas: m.metadata?.ragas,
+          ragas: m.metadata?.ragas || null,
+          ragasStatus: m.metadata?.ragas_status || null,
+          responseMode: m.metadata?.response_mode || null,
+          requestedMode: m.metadata?.requested_mode || null,
+          modeFallbackReason: m.metadata?.mode_fallback_reason || null,
         }));
 
         setChatHistory(prev =>
@@ -252,7 +340,7 @@ function Chat({ onLogout }) {
         // Session not found or error - log for debugging
         console.error("Failed to load messages:", err);
       });
-  }, [activeChatId]);
+  }, [activeChatId, chatHistory]);
 
   /* ================= LOAD MORE MESSAGES ================= */
   const loadMoreMessages = async () => {
@@ -269,7 +357,11 @@ function Chat({ onLogout }) {
         sender: m.role === "user" ? "user" : "bot",
         timestamp: m.created_at,
         processingTime: m.metadata?.processing_time,
-        ragas: m.metadata?.ragas,
+        ragas: m.metadata?.ragas || null,
+        ragasStatus: m.metadata?.ragas_status || null,
+        responseMode: m.metadata?.response_mode || null,
+        requestedMode: m.metadata?.requested_mode || null,
+        modeFallbackReason: m.metadata?.mode_fallback_reason || null,
       }));
 
       setChatHistory(prev =>
@@ -300,11 +392,52 @@ function Chat({ onLogout }) {
   const handleNewChat = () => {
     setActiveChatId(null);
     setIsNewChat(true);
-    setInput("");
   };
 
   // Temporary state to show first message in new chat before session is created
   const [pendingMessage, setPendingMessage] = useState(null);
+
+  // Handle Enter key on input: voice activation, stop recording, or send
+  const handleInputKeyDown = useCallback((e) => {
+    if (e.key !== 'Enter') return;
+
+    // Enter while recording → stop recording
+    if (isRecording) {
+      e.preventDefault();
+      stopRecording();
+      return;
+    }
+
+    // Enter while loading → cancel the question
+    if (isLoading) {
+      e.preventDefault();
+      abortControllerRef.current?.abort();
+      return;
+    }
+
+    // Enter while transcribing → cancel transcription and focus chatbox
+    if (isTranscribing) {
+      e.preventDefault();
+      cancelTranscription();
+      // Focus the input after cancellation
+      setTimeout(() => {
+        inputRef.current?.focus();
+      }, 0);
+      return;
+    }
+
+    // Read current value from the ref to avoid stale closures
+    const currentValue = inputRef.current?.value || '';
+
+    // Enter with empty input → start voice recording
+    if (!currentValue.trim()) {
+      e.preventDefault();
+      startRecording();
+      return;
+    }
+
+    // Otherwise let Enter propagate naturally → form onSubmit fires
+  }, [isRecording, isTranscribing, isLoading, startRecording, stopRecording, cancelTranscription]);
 
   const handleSendMessage = useCallback(async (e) => {
     e.preventDefault();
@@ -314,8 +447,8 @@ function Chat({ onLogout }) {
     setInput("");
     setIsLoading(true);
 
+    // Optimistically Add User Message
     if (activeChatId) {
-      // Existing chat - add message immediately
       setChatHistory(prev =>
         prev.map(c =>
           c.id === activeChatId
@@ -324,55 +457,179 @@ function Chat({ onLogout }) {
         )
       );
     } else {
-      // New chat - show message immediately via pending state
       setPendingMessage(userMessage);
     }
 
+    let createdSessionId = null;
+
     try {
-      const res = await api.post("/api/chat", {
-        message: userMessage.text,
-        session_id: isNewChat ? null : activeChatId,
+      // Use fetch for streaming (axios doesn't support it well in browser)
+      const token = localStorage.getItem("access_token");
+      const currentSessionId = isNewChat ? null : activeChatId;
+      createdSessionId = currentSessionId;
+
+      // Create AbortController for cancellation support
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
+
+      const response = await fetch(`${api.defaults.baseURL}/api/chat/stream`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          message: userMessage.text,
+          session_id: currentSessionId,
+          use_page_images: useVisionMode,
+        }),
+        signal: abortController.signal
       });
 
-      const sessionId = res.data.session_id;
+      if (!response.ok) throw new Error("Stream failed");
 
-      if (isNewChat) {
-        const newSession = {
-          id: sessionId,
-          title: userMessage.text.substring(0, 50),
-          messages: [userMessage],
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        };
-        setChatHistory(prev => [newSession, ...prev]);
-        setActiveChatId(sessionId);
-        setIsNewChat(false);
-        setPendingMessage(null); // Clear pending since message is now in session
-      }
-
+      // Setup Bot Message Placeholder
       const botMessage = {
-        text: res.data.reply,
+        text: "",
         sender: "bot",
         timestamp: new Date().toISOString(),
-        processingTime: res.data.processing_time,
-        ragas: res.data.ragas
+        isStreaming: true,
+        responseMode: useVisionMode ? "vision" : "text",
+        requestedMode: useVisionMode ? "vision" : "text",
+        modeFallbackReason: null,
       };
 
-      setChatHistory(prev =>
-        prev.map(c =>
-          c.id === sessionId
-            ? { ...c, messages: [...c.messages, botMessage], updated_at: new Date().toISOString() }
-            : c
-        )
-      );
+      // If existing chat, add placeholder now
+      if (!isNewChat && activeChatId) {
+        setChatHistory(prev => prev.map(c =>
+          c.id === activeChatId ? { ...c, messages: [...c.messages, botMessage] } : c
+        ));
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      let streamDone = false;
+      while (!streamDone) {
+        const { value, done } = await reader.read();
+        if (done) {
+          streamDone = true;
+          break;
+        }
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || ""; // Keep last partial line
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const event = JSON.parse(line);
+
+            if (event.type === "session") {
+              createdSessionId = event.id;
+
+              // If this was a new chat, we need to create the session in state now
+              if (isNewChat) {
+                const newSession = {
+                  id: createdSessionId,
+                  title: userMessage.text.substring(0, 50),
+                  messages: [userMessage, botMessage],
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                };
+                setChatHistory(prev => [newSession, ...prev]);
+                setActiveChatId(createdSessionId);
+                setIsNewChat(false);
+                setPendingMessage(null);
+              }
+            } else if (event.type === "token") {
+              // Update text - ensure event.text is always a string
+              const tokenText = typeof event.text === 'string' ? event.text : String(event.text || '');
+              setChatHistory(prev => prev.map(c => {
+                if (c.id === createdSessionId) {
+                  const msgs = [...c.messages];
+                  const last = msgs[msgs.length - 1];
+                  if (last.sender === 'bot') {
+                    const currentText = typeof last.text === 'string' ? last.text : String(last.text || '');
+                    msgs[msgs.length - 1] = { ...last, text: currentText + tokenText };
+                    return { ...c, messages: msgs };
+                  }
+                }
+                return c;
+              }));
+            } else if (event.type === "context") {
+              // Context event - could show sources in future if needed
+            } else if (event.type === "stats") {
+              const stats = event.data;
+              setChatHistory(prev => prev.map(c => {
+                if (c.id === createdSessionId) {
+                  const msgs = [...c.messages];
+                  const last = msgs[msgs.length - 1];
+                  const finalText = stats.full_reply || last.text;
+                  msgs[msgs.length - 1] = {
+                    ...last,
+                    processingTime: stats.processing_time,
+                    ragas: stats.ragas || null,
+                    ragasStatus: stats.ragas_status || null,
+                    responseMode: stats.response_mode || last.responseMode || null,
+                    requestedMode: stats.requested_mode || last.requestedMode || null,
+                    modeFallbackReason: stats.mode_fallback_reason || null,
+                    // Ensure text is final and is a string
+                    text: typeof finalText === 'string' ? finalText : String(finalText || ''),
+                    isStreaming: false
+                  };
+                  return { ...c, messages: msgs, updated_at: new Date().toISOString() };
+                }
+                return c;
+              }));
+            }
+          } catch (e) {
+            console.error("Stream parse error", e, line);
+          }
+        }
+
+        // Auto-scroll
+        chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      }
+
     } catch (error) {
       console.error("Chat error:", error);
-      setPendingMessage(null); // Clear on error too
+      setPendingMessage(null);
+
+      const isCancelled = error.name === 'AbortError';
+      const targetId = createdSessionId || activeChatId;
+
+      if (targetId) {
+        setChatHistory(prev => prev.map(c => {
+          if (c.id !== targetId) return c;
+
+          // Remove any in-progress bot message (streaming placeholder)
+          const cleaned = c.messages.filter(m => !m.isStreaming || m.text);
+
+          return {
+            ...c,
+            messages: [...cleaned, {
+              sender: 'bot',
+              text: isCancelled
+                ? "This question was cancelled."
+                : "Sorry, I encountered an error. Please try again.",
+              timestamp: new Date().toISOString(),
+              isCancelled: isCancelled,
+            }]
+          };
+        }));
+      }
     } finally {
       setIsLoading(false);
-      setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 100);
+      abortControllerRef.current = null;
+      setTimeout(() => {
+        chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+        inputRef.current?.focus();
+      }, 100);
     }
-  }, [input, isLoading, activeChatId, isNewChat]);
+  }, [input, isLoading, activeChatId, isNewChat, useVisionMode]);
 
   /* ================= CHAT PINNING ================= */
 
@@ -423,6 +680,7 @@ function Chat({ onLogout }) {
 
 
   const activeChat = chatHistory.find(c => c.id === activeChatId);
+  const isEmptyChat = (isNewChat || !activeChatId) && !isLoading && !pendingMessage;
 
   /* ================= UI ================= */
   return (
@@ -466,7 +724,7 @@ function Chat({ onLogout }) {
           )}
           {/* Collapse/Close Button */}
           <button
-            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            onClick={(e) => { e.currentTarget.blur(); setSidebarCollapsed(!sidebarCollapsed); }}
             className="p-2 hover:bg-gray-100 rounded-lg transition-all text-gray-500 hover:text-gray-700"
             title={isMobile ? 'Close menu' : (sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar')}
           >
@@ -480,8 +738,9 @@ function Chat({ onLogout }) {
 
         {/* New Chat Button */}
         <button
-          onClick={handleNewChat}
-          className={`flex items-center justify-center gap-2 w-full p-3 mb-4 bg-gradient-to-r from-blue-500 to-blue-600 text-white hover:from-blue-600 hover:to-blue-700 rounded-xl transition-all text-sm font-semibold shadow-md hover:shadow-lg ${!isMobile && sidebarCollapsed ? 'px-0' : ''}`}
+          onClick={(e) => { e.currentTarget.blur(); handleNewChat(); }}
+          disabled={isLoading}
+          className={`flex items-center justify-center gap-2 w-full p-3 mb-4 bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-xl transition-all text-sm font-semibold shadow-md ${isLoading ? 'opacity-50 cursor-default' : 'hover:from-blue-600 hover:to-blue-700 hover:shadow-lg cursor-pointer'} ${!isMobile && sidebarCollapsed ? 'px-0' : ''}`}
           title="New Chat"
         >
           <Plus size={18} />
@@ -497,11 +756,12 @@ function Chat({ onLogout }) {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search chats..."
-              className="w-full pl-9 pr-8 py-2 text-sm bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300"
+              disabled={isLoading}
+              className={`w-full pl-9 pr-8 py-2 text-sm bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300 ${isLoading ? 'opacity-50 cursor-default' : ''}`}
             />
             {searchQuery && (
               <button
-                onClick={() => setSearchQuery("")}
+                onClick={(e) => { e.currentTarget.blur(); setSearchQuery(""); }}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1 hover:bg-gray-200 rounded text-gray-400 hover:text-gray-600"
               >
                 <X size={14} />
@@ -522,8 +782,9 @@ function Chat({ onLogout }) {
             {sortedChatHistory.map(chat => (
               <div
                 key={chat.id}
-                onClick={() => setActiveChatId(chat.id)}
-                className={`group relative w-full text-left px-3 py-2.5 rounded-lg flex items-center gap-3 cursor-pointer transition-colors
+                onClick={() => { if (!isLoading) { setActiveChatId(chat.id); setIsNewChat(false); } }}
+                className={`group relative w-full text-left px-3 py-2.5 rounded-lg flex items-center gap-3 transition-colors
+                ${isLoading ? 'opacity-50 cursor-default' : 'cursor-pointer'}
                 ${chat.id === activeChatId ? "bg-blue-50/80 text-blue-700" : "text-gray-600 hover:bg-gray-50"}
                 ${sidebarCollapsed ? 'justify-center px-0' : ''}`}
                 title={sidebarCollapsed ? (chat.title || "New Chat") : undefined}
@@ -551,16 +812,18 @@ function Chat({ onLogout }) {
 
                 {/* === ACTION BUTTONS on Hover === */}
                 {!sidebarCollapsed && (
-                  <div className="absolute right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <div className={`absolute right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity ${isLoading ? 'pointer-events-none opacity-0' : ''}`}>
                     <button
-                      onClick={(e) => togglePin(e, chat.id)}
+                      onClick={(e) => { e.currentTarget.blur(); togglePin(e, chat.id); }}
+                      disabled={isLoading}
                       className={`p-1.5 rounded ${pinnedChats.includes(chat.id) ? 'text-amber-500' : 'text-gray-400 hover:text-amber-500 hover:bg-amber-50'}`}
                       title={pinnedChats.includes(chat.id) ? "Unpin" : "Pin"}
                     >
                       <Pin size={14} className={pinnedChats.includes(chat.id) ? 'fill-amber-500' : ''} />
                     </button>
                     <button
-                      onClick={(e) => handleDeleteSession(e, chat.id)}
+                      onClick={(e) => { e.currentTarget.blur(); handleDeleteSession(e, chat.id); }}
+                      disabled={isLoading}
                       className="p-1.5 hover:bg-red-100 rounded text-gray-400 hover:text-red-500"
                       title="Delete"
                     >
@@ -584,7 +847,7 @@ function Chat({ onLogout }) {
             </div>
           )}
           <button
-            onClick={onLogout}
+            onClick={(e) => { e.currentTarget.blur(); onLogout(); }}
             className={`flex items-center gap-1.5 text-gray-500 hover:text-red-600 hover:bg-red-50 px-2 py-1.5 rounded-lg transition-all text-sm font-medium ${!isMobile && sidebarCollapsed ? 'mt-2' : ''}`}
             title="Logout"
           >
@@ -605,7 +868,7 @@ function Chat({ onLogout }) {
             {/* Hamburger menu for mobile */}
             {isMobile && (
               <button
-                onClick={() => setSidebarCollapsed(false)}
+                onClick={(e) => { e.currentTarget.blur(); setSidebarCollapsed(false); }}
                 className="p-2 hover:bg-gray-100 rounded-lg text-gray-600"
                 title="Open menu"
               >
@@ -626,352 +889,419 @@ function Chat({ onLogout }) {
             </div>
           </div>
 
-
         </header>
 
-        {/* CHAT AREA */}
-        <div className="flex-1 overflow-y-auto p-4 sm:p-6 scroll-smooth">
-          <div className="max-w-3xl mx-auto flex flex-col gap-6 pb-4">
+        {isEmptyChat ? (
+          /* ===== CENTERED LAYOUT FOR NEW/EMPTY CHATS ===== */
+          <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-6">
+            <div className="flex flex-col items-center justify-center px-4 mb-8">
+              {/* Avatar */}
+              <div className="bg-gradient-to-br from-blue-500 to-blue-600 p-4 rounded-2xl shadow-lg mb-6">
+                <Bot size={40} className="text-white" />
+              </div>
 
-            {(!activeChat || activeChat.messages.length === 0) && !isLoading && !pendingMessage && (
-              <div className="flex flex-col items-center justify-center py-8 px-4">
-                {/* Avatar */}
-                <div className="bg-gradient-to-br from-blue-500 to-blue-600 p-4 rounded-2xl shadow-lg mb-6">
-                  <Bot size={40} className="text-white" />
+              {/* Welcome Text */}
+              <h2 className="text-2xl font-bold text-gray-800">Hi, I'm Panya! 👋</h2>
+            </div>
+
+            {/* Input Form - Centered */}
+            <div className="w-full max-w-3xl px-4">
+              <form
+                onSubmit={handleSendMessage}
+                className="space-y-2"
+              >
+                <div className="flex items-center justify-end gap-2 px-1">
+                  <span className="text-[11px] font-medium text-gray-500">Answer mode</span>
+                  <div className="inline-flex rounded-lg border border-gray-200 bg-white p-0.5">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(false); }}
+                      disabled={isLoading}
+                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${!useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
+                    >
+                      Text
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(true); }}
+                      disabled={isLoading}
+                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
+                    >
+                      Vision
+                    </button>
+                  </div>
                 </div>
-
-                {/* Welcome Text */}
-                <h2 className="text-2xl font-bold text-gray-800 mb-2">Hi, I'm Panya! 👋</h2>
-                <p className="text-gray-500 text-center max-w-md mb-8">
-                  Your Industrial Automation & PLC Expert Assistant. I can help you with troubleshooting, error codes, and technical documentation.
-                </p>
-
-                {/* Tips Card */}
-                <div className="bg-blue-50 border border-blue-100 rounded-xl p-5 max-w-lg w-full">
-                  <h3 className="font-semibold text-blue-800 mb-3 flex items-center gap-2">
-                    <span className="text-lg">💡</span> Tips for Best Results
-                  </h3>
-                  <ul className="space-y-2 text-sm text-blue-700">
-                    <li className="flex items-start gap-2">
-                      <span className="text-blue-400 mt-0.5">•</span>
-                      <span><strong>Be specific</strong> — Include product names, model numbers, or error codes</span>
-                    </li>
-                    <li className="flex items-start gap-2">
-                      <span className="text-blue-400 mt-0.5">•</span>
-                      <span><strong>Mention the manual</strong> — e.g., "In the FX3 manual..." or "Data Collector..."</span>
-                    </li>
-                    <li className="flex items-start gap-2">
-                      <span className="text-blue-400 mt-0.5">•</span>
-                      <span><strong>Ask one thing at a time</strong> — Focused questions get better answers</span>
-                    </li>
-                  </ul>
+                <div className="flex-1 flex items-center bg-gray-50 border border-gray-200 rounded-3xl px-2 py-2 focus-within:ring-2 focus-within:ring-blue-100 transition-all focus-within:border-blue-300 focus-within:bg-white shadow-sm">
+                  <input
+                    ref={inputRef}
+                    type="text"
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    placeholder={isLoading ? "Press Enter to cancel the question" : isRecording ? "Listening... (Press Enter to stop)" : isTranscribing ? "Transcribing... (Press Enter to cancel)" : "Ask about PLC, automation... (Press Enter to enable voice input)"}
+                    className="flex-1 bg-transparent focus:outline-none text-gray-800 placeholder-gray-400 px-3 py-1.5 min-w-0"
+                    readOnly={isLoading || isTranscribing}
+                    onKeyDown={handleInputKeyDown}
+                    autoFocus
+                    aria-label="Message input"
+                  />
+                  <button
+                    type="button"
+                    onClick={(e) => { e.currentTarget.blur(); (isTranscribing ? cancelTranscription : (isRecording ? stopRecording : startRecording))(); }}
+                    disabled={isLoading}
+                    className={`p-2.5 rounded-full transition-all flex-shrink-0 mr-1 group ${isLoading ? 'pointer-events-none opacity-50' : ''} ${isRecording
+                      ? 'bg-blue-500 text-white animate-pulse'
+                      : isTranscribing
+                        ? 'bg-orange-100 text-orange-500 hover:bg-orange-200 cursor-pointer'
+                        : 'hover:bg-gray-200 text-gray-500 hover:text-gray-700'
+                      }`}
+                    aria-label={isTranscribing ? "Cancel transcription" : (isRecording ? "Stop recording" : "Start voice input")}
+                    title={isTranscribing ? "Click to cancel" : (isRecording ? "Click to stop" : "Voice input")}
+                  >
+                    {isTranscribing ? (
+                      <div className="relative">
+                        <LoaderCircle size={20} className="animate-spin" />
+                        <X size={10} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" />
+                      </div>
+                    ) : isRecording ? (
+                      <Ear size={20} />
+                    ) : (
+                      <Mic size={20} />
+                    )}
+                  </button>
+                  {isLoading ? (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.currentTarget.blur(); abortControllerRef.current?.abort(); }}
+                      className="bg-red-600 text-white p-2.5 rounded-full hover:bg-red-700 transition-all shadow-sm flex-shrink-0"
+                      aria-label="Cancel request"
+                      title="Cancel"
+                    >
+                      <StopCircle size={20} />
+                    </button>
+                  ) : (
+                    <button
+                      type="submit"
+                      disabled={!input.trim() || isRecording || isTranscribing}
+                      className="bg-blue-600 text-white p-2.5 rounded-full hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed transition-all shadow-sm flex-shrink-0"
+                      aria-label="Send message"
+                    >
+                      <Send size={20} className={input.trim() ? "translate-x-0.5" : ""} />
+                    </button>
+                  )}
                 </div>
+              </form>
+              <div className="text-center text-[10px] text-gray-400 mt-3 font-medium">
+                PLC Assistant can make mistakes. Check important info.
+              </div>
+            </div>
+          </div>
+        ) : (
+          /* ===== NORMAL LAYOUT WITH MESSAGES ===== */
+          <>
+            <div className="flex-1 overflow-y-auto p-4 sm:p-6 scroll-smooth">
+              <div className="max-w-3xl mx-auto flex flex-col gap-6 pb-4">
 
-                {/* Example Prompts */}
-                <div className="mt-6 w-full max-w-lg">
-                  <p className="text-xs text-gray-400 uppercase tracking-wider mb-3 text-center">Try asking</p>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {[
-                      "What does error code F800H mean?",
-                      "How to configure CC-Link IE Field?",
-                      "FX3 timer instructions",
-                      "Data Collector troubleshooting"
-                    ].map((example, idx) => (
+                {/* Load More Button */}
+                {activeChatId && chatPagination[activeChatId]?.hasMore && (
+                  <div className="flex justify-center py-3">
+                    <button
+                      onClick={(e) => { e.currentTarget.blur(); loadMoreMessages(); }}
+                      disabled={loadingMore}
+                      className="flex items-center gap-2 px-4 py-2 text-sm bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-lg transition-all disabled:opacity-50"
+                    >
+                      {loadingMore ? (
+                        <>
+                          <LoaderCircle size={14} className="animate-spin" />
+                          Loading...
+                        </>
+                      ) : (
+                        "↑ Load older messages"
+                      )}
+                    </button>
+                  </div>
+                )}
+
+                {activeChat?.messages.map((m, i) => (
+                  <div
+                    key={i}
+                    className={`flex flex-col ${m.sender === "user" ? "items-end" : "items-start"}`}
+                  >
+                    <div
+                      className={`max-w-[85%] px-5 py-3.5 rounded-2xl shadow-sm text-[15px] leading-relaxed break-words overflow-hidden
+                        ${m.sender === "user"
+                          ? "bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-br-sm"
+                          : "bg-white text-gray-800 border border-gray-100 rounded-bl-sm prose prose-sm max-w-none"
+                        }`}
+                      style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
+                    >
+                      {m.sender === "bot" ? (
+                        m.isCancelled ? (
+                          <span className="text-red-500 font-medium text-sm">{m.text}</span>
+                        ) : m.isStreaming && !m.text ? (
+                          <div className="flex items-center gap-3 text-gray-500 text-sm">
+                            <LoaderCircle size={18} className="animate-spin text-blue-500" />
+                            <span className="font-medium">Thinking...</span>
+                          </div>
+                        ) :
+                          <ReactMarkdown
+                            components={{
+                              code({ inline, className, children, ...props }) {
+                                const match = /language-(\w+)/.exec(className || '');
+                                return !inline && match ? (
+                                  <SyntaxHighlighter
+                                    style={oneDark}
+                                    language={match[1]}
+                                    PreTag="div"
+                                    className="rounded-lg text-sm my-2"
+                                    {...props}
+                                  >
+                                    {String(children).replace(/\n$/, '')}
+                                  </SyntaxHighlighter>
+                                ) : (
+                                  <code className="bg-gray-100 px-1.5 py-0.5 rounded text-sm font-mono" {...props}>
+                                    {children}
+                                  </code>
+                                );
+                              },
+                              p({ children }) {
+                                return <p className="mb-2 last:mb-0">{children}</p>;
+                              },
+                              ul({ children }) {
+                                return <ul className="list-disc ml-4 mb-2">{children}</ul>;
+                              },
+                              ol({ children }) {
+                                return <ol className="list-decimal ml-4 mb-2">{children}</ol>;
+                              },
+                              li({ children }) {
+                                return <li className="mb-1">{children}</li>;
+                              },
+                              strong({ children }) {
+                                return <strong className="font-semibold">{children}</strong>;
+                              },
+                              a({ href, children }) {
+                                return <a href={href} className="text-blue-600 hover:underline" target="_blank" rel="noopener noreferrer">{children}</a>;
+                              },
+                              table({ children }) {
+                                return (
+                                  <div className="overflow-x-auto my-3">
+                                    <table className="min-w-full border-collapse border border-gray-300 text-sm">
+                                      {children}
+                                    </table>
+                                  </div>
+                                );
+                              },
+                              thead({ children }) {
+                                return <thead className="bg-gray-100">{children}</thead>;
+                              },
+                              tbody({ children }) {
+                                return <tbody>{children}</tbody>;
+                              },
+                              tr({ children }) {
+                                return <tr className="border-b border-gray-200">{children}</tr>;
+                              },
+                              th({ children }) {
+                                return (
+                                  <th className="border border-gray-300 px-3 py-2 text-left font-semibold bg-gray-50">
+                                    {children}
+                                  </th>
+                                );
+                              },
+                              td({ children }) {
+                                return (
+                                  <td className="border border-gray-300 px-3 py-2">
+                                    {children}
+                                  </td>
+                                );
+                              },
+                              hr() {
+                                return null;
+                              }
+                            }}
+                          >
+                            {fixMarkdownTable(stripQualityMetrics(typeof m.text === 'string' ? m.text : String(m.text || '')))}
+                          </ReactMarkdown>
+                      ) : (
+                        m.text
+                      )}
+                    </div>
+
+                    {m.sender === "bot" && (
+                      <div className="mt-1 max-w-[85%] rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
+                        <div className="mb-1 flex items-center justify-between gap-2">
+                          <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                            RAGAS Metrics
+                            {m.ragasStatus === "pending" ? " (Pending)" : ""}
+                          </div>
+                          {formatResponseMode(m.responseMode) && (
+                            <span className="rounded bg-gray-200 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
+                              Mode: {formatResponseMode(m.responseMode)}
+                              {shouldShowVisionFallback(m) ? " (Fallback)" : ""}
+                            </span>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                          {RAGAS_METRIC_KEYS.map((key) => (
+                            <div
+                              key={key}
+                              className="flex items-center justify-between gap-2 text-[11px] text-gray-700"
+                            >
+                              <span>{RAGAS_METRIC_LABELS[key]}</span>
+                              <span className="font-semibold text-gray-900">
+                                {formatRagasMetric(m.ragas?.[key])}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    
+                    <div className={`flex items-center gap-2 mt-1 ${m.sender === "user" ? "flex-row-reverse" : ""}`}>
+                      {m.timestamp && (
+                        <span className="text-[10px] text-gray-400 px-1">
+                          {formatTime(m.timestamp)}
+                        </span>
+                      )}
                       <button
-                        key={idx}
-                        onClick={() => {
-                          setInput(example);
+                        onClick={(e) => { e.currentTarget.blur(); copyToClipboard(stripQualityMetrics(m.text), i); }}
+                        className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-all"
+                        title={copiedMessageId === i ? "Copied!" : "Copy message"}
+                      >
+                        {copiedMessageId === i ? (
+                          <Check size={14} className="text-green-500" />
+                        ) : (
+                          <Copy size={14} />
+                        )}
+                      </button>
+                      <button
+                        onClick={(e) => {
+                          e.currentTarget.blur();
+                          setInput(stripQualityMetrics(m.text));
                           inputRef.current?.focus();
                         }}
-                        className="text-left px-4 py-3 bg-white border border-gray-200 rounded-xl text-sm text-gray-600 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 transition-all"
+                        className="p-1 rounded hover:bg-blue-100 text-gray-400 hover:text-blue-600 transition-all"
+                        title="Copy to chatbar"
                       >
-                        {example}
+                        <CornerDownLeft size={14} />
                       </button>
-                    ))}
+                    </div>
                   </div>
-                </div>
-              </div>
-            )}
+                ))}
 
-            {/* Load More Button */}
-            {activeChatId && chatPagination[activeChatId]?.hasMore && (
-              <div className="flex justify-center py-3">
-                <button
-                  onClick={loadMoreMessages}
-                  disabled={loadingMore}
-                  className="flex items-center gap-2 px-4 py-2 text-sm bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-lg transition-all disabled:opacity-50"
-                >
-                  {loadingMore ? (
-                    <>
-                      <LoaderCircle size={14} className="animate-spin" />
-                      Loading...
-                    </>
-                  ) : (
-                    "↑ Load older messages"
-                  )}
-                </button>
-              </div>
-            )}
-
-            {activeChat?.messages.map((m, i) => (
-              <div
-                key={i}
-                className={`flex flex-col ${m.sender === "user" ? "items-end" : "items-start"}`}
-              >
-                <div
-                  className={`max-w-[85%] px-5 py-3.5 rounded-2xl shadow-sm text-[15px] leading-relaxed break-words overflow-hidden
-                    ${m.sender === "user"
-                      ? "bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-br-sm"
-                      : "bg-white text-gray-800 border border-gray-100 rounded-bl-sm prose prose-sm max-w-none"
-                    }`}
-                  style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
-                >
-                  {m.sender === "bot" ? (
-                    <ReactMarkdown
-                      components={{
-                        code({ node, inline, className, children, ...props }) {
-                          const match = /language-(\w+)/.exec(className || '');
-                          return !inline && match ? (
-                            <SyntaxHighlighter
-                              style={oneDark}
-                              language={match[1]}
-                              PreTag="div"
-                              className="rounded-lg text-sm my-2"
-                              {...props}
-                            >
-                              {String(children).replace(/\n$/, '')}
-                            </SyntaxHighlighter>
-                          ) : (
-                            <code className="bg-gray-100 px-1.5 py-0.5 rounded text-sm font-mono" {...props}>
-                              {children}
-                            </code>
-                          );
-                        },
-                        p({ children }) {
-                          return <p className="mb-2 last:mb-0">{children}</p>;
-                        },
-                        ul({ children }) {
-                          return <ul className="list-disc ml-4 mb-2">{children}</ul>;
-                        },
-                        ol({ children }) {
-                          return <ol className="list-decimal ml-4 mb-2">{children}</ol>;
-                        },
-                        li({ children }) {
-                          return <li className="mb-1">{children}</li>;
-                        },
-                        strong({ children }) {
-                          return <strong className="font-semibold">{children}</strong>;
-                        },
-                        a({ href, children }) {
-                          return <a href={href} className="text-blue-600 hover:underline" target="_blank" rel="noopener noreferrer">{children}</a>;
-                        },
-                        table({ children }) {
-                          // Convert table to bullet point list
-                          return <div className="my-3 space-y-1">{children}</div>;
-                        },
-                        thead() {
-                          // Hide thead - we'll use header values inline
-                          return null;
-                        },
-                        tbody({ children }) {
-                          return <ul className="list-disc ml-4 space-y-2">{children}</ul>;
-                        },
-                        tr({ children }) {
-                          // Convert row to a bullet item with all cells
-                          const cells = [];
-                          if (Array.isArray(children)) {
-                            children.forEach((child, i) => {
-                              if (child?.props?.children) {
-                                cells.push(child.props.children);
-                              }
-                            });
-                          }
-                          if (cells.length === 0) return null;
-                          return (
-                            <li className="text-sm">
-                              <span className="font-semibold">{cells[0]}</span>
-                              {cells.length > 1 && `: ${cells.slice(1).join(' | ')}`}
-                            </li>
-                          );
-                        },
-                        th({ children }) {
-                          return <span className="font-semibold">{children}</span>;
-                        },
-                        td({ children }) {
-                          return <span>{children}</span>;
-                        }
-                      }}
+                {/* Show pending message for new chat before session is created */}
+                {pendingMessage && !activeChat && (
+                  <div className="flex flex-col items-end">
+                    <div
+                      className="max-w-[85%] px-5 py-3.5 rounded-2xl shadow-sm text-[15px] leading-relaxed bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-br-sm break-words overflow-hidden"
+                      style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
                     >
-                      {fixMarkdownTable(m.text)}
-                    </ReactMarkdown>
-                  ) : (
-                    m.text
-                  )}
-                </div>
-                {/* Metrics Display for Bot Messages */}
-                {m.sender === "bot" && (m.processingTime || m.ragas) && (
-                  <div className="flex flex-wrap items-center gap-3 mt-2 text-[11px] text-gray-600 bg-gray-50 rounded-lg px-3 py-2">
-                    {m.processingTime && (
-                      <span className="flex items-center gap-1">
-                        <span>⏱️</span>
-                        <span className="font-medium">{m.processingTime.toFixed(2)}s</span>
+                      {pendingMessage.text}
+                    </div>
+                    {pendingMessage.timestamp && (
+                      <span className="text-[10px] text-gray-400 mt-1 px-1">
+                        {formatTime(pendingMessage.timestamp)}
                       </span>
                     )}
-                    {m.ragas?.scores && (
-                      <>
-                        <span className="text-gray-300">|</span>
-                        {m.ragas.scores.context_precision != null && (
-                          <span title="Context Precision">
-                            <span className="text-gray-500">Context Precision:</span>{" "}
-                            <span className="font-medium">{(m.ragas.scores.context_precision * 100).toFixed(1)}%</span>
-                          </span>
-                        )}
-                        {m.ragas.scores.context_recall != null && (
-                          <span title="Context Recall">
-                            <span className="text-gray-500">Context Recall:</span>{" "}
-                            <span className="font-medium">{(m.ragas.scores.context_recall * 100).toFixed(1)}%</span>
-                          </span>
-                        )}
-                        {m.ragas.scores.answer_relevancy != null && (
-                          <span title="Answer Relevancy">
-                            <span className="text-gray-500">Answer Relevancy:</span>{" "}
-                            <span className="font-medium">{(m.ragas.scores.answer_relevancy * 100).toFixed(1)}%</span>
-                          </span>
-                        )}
-                        {m.ragas.scores.faithfulness != null && (
-                          <span title="Faithfulness">
-                            <span className="text-gray-500">Faithfulness:</span>{" "}
-                            <span className="font-medium">{(m.ragas.scores.faithfulness * 100).toFixed(1)}%</span>
-                          </span>
-                        )}
-                      </>
-                    )}
                   </div>
                 )}
-                <div className={`flex items-center gap-2 mt-1 ${m.sender === "user" ? "flex-row-reverse" : ""}`}>
-                  {m.timestamp && (
-                    <span className="text-[10px] text-gray-400 px-1">
-                      {formatTime(m.timestamp)}
-                    </span>
-                  )}
+
+
+
+                <div ref={chatEndRef} />
+              </div>
+            </div>
+
+            {/* INPUT AREA - Bottom pinned */}
+            <div className="p-4 shrink-0">
+              <form
+                onSubmit={handleSendMessage}
+                className="max-w-3xl mx-auto space-y-2"
+              >
+                <div className="flex items-center justify-end gap-2 px-1">
+                  <span className="text-[11px] font-medium text-gray-500">Answer mode</span>
+                  <div className="inline-flex rounded-lg border border-gray-200 bg-white p-0.5">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(false); }}
+                      disabled={isLoading}
+                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${!useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
+                    >
+                      Text
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(true); }}
+                      disabled={isLoading}
+                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
+                    >
+                      Vision
+                    </button>
+                  </div>
+                </div>
+                <div className={`flex-1 flex items-center bg-gray-50 border border-gray-200 rounded-3xl px-2 py-2 focus-within:ring-2 focus-within:ring-blue-100 transition-all focus-within:border-blue-300 focus-within:bg-white shadow-sm ${isLoading ? 'opacity-60' : ''}`}>
+                  <input
+                    ref={inputRef}
+                    type="text"
+                    value={input}
+                    onChange={(e) => setInput(e.target.value)}
+                    placeholder={isLoading ? "Press Enter to cancel the question" : isRecording ? "Listening... (Press Enter to stop)" : isTranscribing ? "Transcribing... (Press Enter to cancel)" : "Ask about PLC, automation... (Press Enter to enable voice input)"}
+                    className="flex-1 bg-transparent focus:outline-none text-gray-800 placeholder-gray-400 px-3 py-1.5"
+                    readOnly={isLoading || isTranscribing}
+                    onKeyDown={handleInputKeyDown}
+                    autoFocus
+                    aria-label="Message input"
+                  />
                   <button
-                    onClick={() => copyToClipboard(m.text, i)}
-                    className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-all"
-                    title={copiedMessageId === i ? "Copied!" : "Copy message"}
+                    type="button"
+                    onClick={(e) => { e.currentTarget.blur(); (isTranscribing ? cancelTranscription : (isRecording ? stopRecording : startRecording))(); }}
+                    disabled={isLoading}
+                    className={`p-2.5 rounded-full transition-all flex-shrink-0 mr-1 group ${isLoading ? 'pointer-events-none opacity-50' : ''} ${isRecording
+                      ? 'bg-blue-500 text-white animate-pulse'
+                      : isTranscribing
+                        ? 'bg-orange-100 text-orange-500 hover:bg-orange-200 cursor-pointer'
+                        : 'hover:bg-gray-200 text-gray-500 hover:text-gray-700'
+                      }`}
+                    aria-label={isTranscribing ? "Cancel transcription" : (isRecording ? "Stop recording" : "Start voice input")}
+                    title={isTranscribing ? "Click to cancel" : (isRecording ? "Click to stop" : "Voice input")}
                   >
-                    {copiedMessageId === i ? (
-                      <Check size={14} className="text-green-500" />
+                    {isTranscribing ? (
+                      <div className="relative">
+                        <LoaderCircle size={20} className="animate-spin" />
+                        <X size={10} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" />
+                      </div>
+                    ) : isRecording ? (
+                      <Ear size={20} />
                     ) : (
-                      <Copy size={14} />
+                      <Mic size={20} />
                     )}
                   </button>
-                  <button
-                    onClick={() => {
-                      setInput(m.text);
-                      inputRef.current?.focus();
-                    }}
-                    className="p-1 rounded hover:bg-blue-100 text-gray-400 hover:text-blue-600 transition-all"
-                    title="Copy to chatbar"
-                  >
-                    <CornerDownLeft size={14} />
-                  </button>
+                  {isLoading ? (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.currentTarget.blur(); abortControllerRef.current?.abort(); }}
+                      className="bg-red-600 text-white p-2.5 rounded-full hover:bg-red-700 transition-all shadow-sm flex-shrink-0"
+                      aria-label="Cancel request"
+                      title="Cancel"
+                    >
+                      <StopCircle size={20} />
+                    </button>
+                  ) : (
+                    <button
+                      type="submit"
+                      disabled={!input.trim() || isRecording || isTranscribing}
+                      className="bg-blue-600 text-white p-2.5 rounded-full hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed transition-all shadow-sm flex-shrink-0"
+                      aria-label="Send message"
+                    >
+                      <Send size={20} className={input.trim() ? "translate-x-0.5" : ""} />
+                    </button>
+                  )}
                 </div>
+              </form>
+              <div className="text-center text-[10px] text-gray-400 mt-3 font-medium">
+                PLC Assistant can make mistakes. Check important info.
               </div>
-            ))}
-
-            {/* Show pending message for new chat before session is created */}
-            {pendingMessage && !activeChat && (
-              <div className="flex flex-col items-end">
-                <div
-                  className="max-w-[85%] px-5 py-3.5 rounded-2xl shadow-sm text-[15px] leading-relaxed bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-br-sm break-words overflow-hidden"
-                  style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
-                >
-                  {pendingMessage.text}
-                </div>
-                {pendingMessage.timestamp && (
-                  <span className="text-[10px] text-gray-400 mt-1 px-1">
-                    {formatTime(pendingMessage.timestamp)}
-                  </span>
-                )}
-              </div>
-            )}
-
-            {isLoading && (
-              <div className="flex justify-start animate-pulse">
-                <div className="bg-white px-4 py-3 rounded-2xl border border-gray-100 flex items-center gap-3 text-gray-500 text-sm shadow-sm">
-                  <LoaderCircle size={18} className="animate-spin text-blue-500" />
-                  <span className="font-medium">Thinking...</span>
-                </div>
-              </div>
-            )}
-
-            <div ref={chatEndRef} />
-          </div>
-        </div>
-
-        {/* INPUT AREA */}
-        <div className="p-4 bg-white border-t shrink-0">
-          <form
-            onSubmit={handleSendMessage}
-            className="max-w-3xl mx-auto flex items-end gap-2"
-          >
-            {/* Input Wrapper */}
-            <div className="flex-1 flex items-center bg-gray-50 border border-gray-200 rounded-3xl px-2 py-2 focus-within:ring-2 focus-within:ring-blue-100 transition-all focus-within:border-blue-300 focus-within:bg-white shadow-sm">
-              <input
-                ref={inputRef}
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder={isRecording ? "Listening..." : isTranscribing ? "Transcribing..." : "Ask about PLC, automation, troubleshooting..."}
-                className="flex-1 bg-transparent focus:outline-none text-gray-800 placeholder-gray-400 px-3 py-1.5"
-                disabled={isLoading || isRecording || isTranscribing}
-                aria-label="Message input"
-              />
-
-              {/* Microphone Button */}
-              <button
-                type="button"
-                onClick={isTranscribing ? cancelTranscription : (isRecording ? stopRecording : startRecording)}
-                disabled={isLoading}
-                className={`p-2.5 rounded-full transition-all flex-shrink-0 mr-1 group ${isRecording
-                  ? 'bg-red-500 text-white animate-pulse'
-                  : isTranscribing
-                    ? 'bg-orange-100 text-orange-500 hover:bg-red-100 hover:text-red-500 cursor-pointer'
-                    : 'hover:bg-gray-200 text-gray-500 hover:text-gray-700'
-                  }`}
-                aria-label={isTranscribing ? "Cancel transcription" : (isRecording ? "Stop recording" : "Start voice input")}
-                title={isTranscribing ? "Click to cancel" : (isRecording ? "Click to stop" : "Voice input")}
-              >
-                {isTranscribing ? (
-                  <LoaderCircle size={20} className="animate-spin group-hover:hidden" />
-                ) : isRecording ? (
-                  <MicOff size={20} />
-                ) : (
-                  <Mic size={20} />
-                )}
-                {isTranscribing && <MicOff size={20} className="hidden group-hover:block" />}
-              </button>
-
-              {/* Send Button */}
-              <button
-                type="submit"
-                disabled={isLoading || !input.trim() || isRecording || isTranscribing}
-                className="bg-blue-600 text-white p-2.5 rounded-full hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed transition-all shadow-sm flex-shrink-0"
-                aria-label="Send message"
-              >
-                {isLoading ? (
-                  <LoaderCircle size={20} className="animate-spin" />
-                ) : (
-                  <Send size={20} className={input.trim() ? "translate-x-0.5" : ""} />
-                )}
-              </button>
             </div>
-          </form>
-
-          <div className="text-center text-[10px] text-gray-400 mt-3 font-medium">
-            PLC Assistant can make mistakes. Check important info.
-          </div>
-        </div>
+          </>
+        )}
       </div>
     </div>
   );

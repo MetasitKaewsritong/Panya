@@ -34,12 +34,12 @@ export function useVoiceRecording(onTranscriptionComplete) {
                 abortControllerRef.current = new AbortController();
 
                 try {
-                    const res = await chatAPI.transcribe(audioBlob);
+                    const res = await chatAPI.transcribe(audioBlob, abortControllerRef.current.signal);
                     if (res.data.text) {
                         onTranscriptionComplete?.(res.data.text);
                     }
                 } catch (error) {
-                    if (error.name !== 'CanceledError' && error.message !== 'canceled') {
+                    if (error.name !== 'CanceledError' && error.name !== 'AbortError' && error.message !== 'canceled') {
                         console.error('Transcription error:', error);
                         alert('Failed to transcribe audio. Please try again.');
                     }

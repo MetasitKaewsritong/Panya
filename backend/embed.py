@@ -49,6 +49,11 @@ from app.embed_logic import (
     create_json_qa_chunks, 
     get_embedding_instruction,
 )
+# Import PDF image extraction utilities
+from app.pdf_image_utils import (
+    extract_pdf_page_images,
+    store_page_images,
+)
 
 # ==== Load config ====
 load_dotenv()
@@ -56,6 +61,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 DB_URL = os.getenv("DATABASE_URL")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+try:
+    PAGE_IMAGE_DPI = int(os.getenv("PAGE_IMAGE_DPI", "150"))
+except Exception:
+    PAGE_IMAGE_DPI = 150
 
 
 def get_device():
@@ -82,6 +91,12 @@ def get_files(paths: List[str]) -> List[str]:
     return all_files
 
 
+def is_golden_qa_file(file_path: str) -> bool:
+    """Detect eval-only Golden QA JSON files by filename."""
+    name = os.path.basename(file_path).lower()
+    return name.endswith(".json") and "golden_qa" in name
+
+
 def flush_chunks(chunks_to_embed: List[Document], embedder, conn, collection: str) -> int:
     """Embed and save a batch of chunks using batch INSERT (5-10x faster)"""
     if not chunks_to_embed:
@@ -106,7 +121,10 @@ def flush_chunks(chunks_to_embed: List[Document], embedder, conn, collection: st
     for chunk, embedding in zip(chunks_to_embed, embeddings):
         text = chunk.page_content
         vector = embedding.tolist()
-        hash_ = hashlib.sha256(text.encode()).hexdigest()
+        # Hash is namespaced by collection + source so identical text can exist across collections/files.
+        source = (chunk.metadata or {}).get("source", "")
+        hash_input = f"{collection}::{source}::{text}"
+        hash_ = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
         metadata_json = json.dumps(chunk.metadata)
         batch_data.append((text, vector, collection, hash_, metadata_json))
     
@@ -158,14 +176,35 @@ def main():
     parser.add_argument("files", nargs="+", help="Path(s) to PDF/JSON file(s) or folder(s) to embed.")
     parser.add_argument("--collection", default="plcnext", help="Collection name.")
     parser.add_argument("--batch-size", type=int, default=1000, help="Number of chunks per embedding batch.")
-    parser.add_argument("--chunk-size", type=int, default=800, help="Max characters per chunk.")
-    parser.add_argument("--chunk-overlap", type=int, default=150, help="Overlap between chunks.")
+    parser.add_argument("--chunk-size", type=int, default=int(os.getenv("CHUNK_SIZE", "1000")), help="Max characters per chunk (default: from CHUNK_SIZE env var).")
+    parser.add_argument("--chunk-overlap", type=int, default=int(os.getenv("CHUNK_OVERLAP", "200")), help="Overlap between chunks (default: from CHUNK_OVERLAP env var).")
     parser.add_argument("--model-cache", default="/app/models", help="Model cache directory.")
     parser.add_argument("--dry-run", action="store_true", help="Parse files but don't embed or save.")
+    parser.add_argument(
+        "--include-golden-qa",
+        action="store_true",
+        help="Include Golden QA JSON files in embedding (disabled by default for unbiased eval).",
+    )
     args = parser.parse_args()
     
     # Get all files
     all_files = get_files(args.files)
+    if not args.include_golden_qa:
+        filtered_files = []
+        skipped = []
+        for path in all_files:
+            if is_golden_qa_file(path):
+                skipped.append(path)
+            else:
+                filtered_files.append(path)
+        all_files = filtered_files
+        if skipped:
+            logging.info(
+                "⏭️ Skipping %d Golden QA file(s) (eval-only mode). Use --include-golden-qa to embed them.",
+                len(skipped),
+            )
+            for p in skipped[:5]:
+                logging.info("   - %s", p)
     
     if not all_files:
         logging.error("No PDF/JSON files found!")
@@ -221,12 +260,53 @@ def main():
                 chunks = create_json_qa_chunks(file_path)
             elif file_path.lower().endswith('.pdf'):
                 try:
-                    loader = DoclingLoader(file_path=file_path, export_type=ExportType.MARKDOWN)
-                    pages = loader.load()
+                    # 1. Extract page images FIRST (before text extraction)
+                    if not args.dry_run:
+                        logging.info(f"📸 Extracting page images from {filename} at {PAGE_IMAGE_DPI} DPI...")
+                        try:
+                            page_images = extract_pdf_page_images(file_path, dpi=PAGE_IMAGE_DPI)
+                            
+                            # Store page images in database
+                            store_page_images(conn, page_images, filename, args.collection)
+                        except Exception as img_error:
+                            logging.error(f"❌ Page image extraction failed: {img_error}")
+                            logging.warning("⚠️ Continuing with text extraction only...")
+                    
+                    # 2. Extract text chunks - try DOC_CHUNKS first, fallback to MARKDOWN
+                    logging.info(f"📄 Extracting text from {filename}...")
+                    try:
+                        # Try DOC_CHUNKS export for page metadata
+                        loader = DoclingLoader(file_path=file_path, export_type=ExportType.DOC_CHUNKS)
+                        pages = loader.load()
+                        
+                        # Check if we got valid page numbers
+                        has_valid_pages = any(doc.metadata.get('page', 0) > 0 for doc in pages)
+                        
+                        if not has_valid_pages:
+                            logging.warning("⚠️ DOC_CHUNKS didn't provide page numbers, trying MARKDOWN...")
+                            loader = DoclingLoader(file_path=file_path, export_type=ExportType.MARKDOWN)
+                            pages = loader.load()
+                            
+                            # Set source metadata but let create_pdf_chunks handle page assignment
+                            for page_doc in pages:
+                                page_doc.metadata['source'] = filename
+                                # Don't set page numbers here - let create_pdf_chunks handle it
+                        
+                    except Exception as e:
+                        logging.error(f"❌ Failed to load with DOC_CHUNKS: {e}")
+                        logging.info("⚠️ Falling back to MARKDOWN export...")
+                        loader = DoclingLoader(file_path=file_path, export_type=ExportType.MARKDOWN)
+                        pages = loader.load()
+                        
+                        # Set source metadata but let create_pdf_chunks handle page assignment
+                        for page_doc in pages:
+                            page_doc.metadata['source'] = filename
+                    
                     chunks = create_pdf_chunks(
                         pages,
                         chunk_size=args.chunk_size,
-                        chunk_overlap=args.chunk_overlap
+                        chunk_overlap=args.chunk_overlap,
+                        pdf_path=file_path  # Pass PDF path for page assignment
                     )
                 except Exception as e:
                     logging.error(f"❌ Failed to process PDF {file_path}: {e}")

@@ -1,78 +1,36 @@
 # ============================================================================
-# backend/main.py v3.0 - Universal PLC Assistant
+# backend/main.py v3.1 - Universal PLC Assistant
 # ============================================================================
-# CHANGES FROM ORIGINAL:
-# 1. ✅ Removed Auto mode entirely - only Fast and Deep modes
-# 2. ✅ Generic PLC branding (removed all PLCnext-specific references)
-# 3. ✅ Improved code organization with clear sections
-# 4. ✅ Better error handling and logging
-# 5. ✅ Performance optimizations
-# 6. ✅ Cleaner prompt engineering
-# 7. ✅ Added comprehensive documentation
-#
-# MODE EXPLANATION:
-# ─────────────────────────────────────────────────────────────────────────────
-# FAST MODE (default):
-#   - Direct LLM response WITHOUT searching the vector database
-#   - Optional web search for current information
-#   - Best for: General PLC concepts, quick troubleshooting tips, syntax help
-#   - Response time: ~5-15 seconds
-#   - Use when: You need quick answers or asking about general topics
-#
-# DEEP MODE:
-#   - Uses RAG (Retrieval-Augmented Generation) pipeline
-#   - Searches vector database for relevant documentation chunks
-#   - Applies reranking for better context selection
-#   - Best for: Specific documentation lookups, detailed specs, accuracy-critical
-#   - Response time: ~30-60 seconds  
-#   - Use when: You need precise information from your embedded documents
-# ─────────────────────────────────────────────────────────────────────────────
+# API provides a RAG-powered chat interface for PLC/Industrial Automation.
+# 
+# Key endpoints:
+#   - POST /api/chat - Main chat endpoint (handled by routes_chat.py)
+#   - POST /api/transcribe - Audio transcription using Whisper
+#   - GET /health - Service health check
+#   - GET /api/collections - List document collections
+#   - GET /api/stats - Document statistics
 # ============================================================================
 
 import os
 import logging
-import requests
 import time
-import math
-import re
-import json
-import io
 from uuid import uuid4
-import mimetypes
 import warnings
 
 from contextlib import asynccontextmanager
-from typing import Any, Optional, List, Dict
-from functools import lru_cache
-
-import numpy as np
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, Depends, Query
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-from langchain_ollama import OllamaLLM
-from sentence_transformers import SentenceTransformer
-from psycopg2 import pool
-import pytesseract
-from PIL import Image
 
 from app.db import init_db_pool
 from app.routes_auth import router as auth_router
 from app.routes_chat import router as chat_router
-from app.routes_auth import get_current_user
 
-# Local imports
-from app.retriever import (
-    PostgresVectorRetriever, 
-    EnhancedFlashrankRerankRetriever, 
-    NoRerankRetriever
-)
-from app.chatbot import answer_question
 from app.embed_logic import get_embedder
 from app.utils import set_llm
 from app.errors import (
-    ErrorResponse, ErrorCode, AppException,
+    ErrorCode, AppException,
     create_error_response
 )
 
@@ -94,11 +52,15 @@ class Config:
         """Validate required configuration"""
         if not Config.DATABASE_URL:
             raise RuntimeError("DATABASE_URL environment variable is required.")
+        # Don't fail on missing GEMINI_API_KEY - allow server to start
+        if not Config.GEMINI_API_KEY:
+            logging.warning("GEMINI_API_KEY not set - LLM features will be unavailable")
     
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2")
-    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    # Gemini Configuration
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-    LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "180"))
+    LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "30"))
     LLM_NUM_PREDICT: int = int(os.getenv("LLM_NUM_PREDICT", "1024"))  # Max output tokens
     
     # Embeddings
@@ -134,205 +96,25 @@ logging.basicConfig(
 logger = logging.getLogger("PLCAssistant")
 
 logger.info("=" * 60)
-logger.info("🤖 PLC Assistant v3.0 - Starting up")
+logger.info("PLC Assistant v3.0 - Starting up")
 logger.info("=" * 60)
 
 # Validate required configuration
 Config.validate()
 
-logger.info(f"  Database URL: {config.DATABASE_URL[:50]}...")
-logger.info(f"  Ollama URL: {config.OLLAMA_BASE_URL}")
-logger.info(f"  Ollama Model: {config.OLLAMA_MODEL}")
+logger.info("  Database URL: configured")
+logger.info(f"  Gemini Model: {config.GEMINI_MODEL}")
 logger.info(f"  Embed Model: {config.EMBED_MODEL_NAME}")
 logger.info("=" * 60)
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
-def to_bool(val: Any) -> Optional[bool]:
-    """Convert various types to boolean"""
-    if val is None:
-        return None
-    if isinstance(val, bool):
-        return val
-    s = str(val).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return None
-
-
-def sanitize_json(obj: Any) -> Any:
-    """
-    Recursively sanitize objects for JSON serialization.
-    Handles numpy types and invalid float values.
-    """
-    if obj is None:
-        return None
-    
-    # Handle numpy types
-    if isinstance(obj, (np.float32, np.float64)):
-        if np.isnan(obj) or np.isinf(obj):
-            return None
-        return float(obj)
-    elif isinstance(obj, (np.int32, np.int64)):
-        return int(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    
-    # Handle Python float
-    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-        return None
-    
-    # Handle containers
-    if isinstance(obj, dict):
-        return {k: sanitize_json(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [sanitize_json(v) for v in obj]
-    
-    return obj
-
-
-# ============================================================================
-# WEB SEARCH
-# ============================================================================
-
-def web_search(query: str, max_results: int = None) -> str:
-    """
-    Search the web using DuckDuckGo HTML interface.
-    
-    Args:
-        query: Search query string
-        max_results: Maximum number of results to return
-        
-    Returns:
-        Formatted string of search results or empty string on failure
-    """
-    if max_results is None:
-        max_results = config.WEB_SEARCH_MAX_RESULTS
-        
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        from urllib.parse import quote_plus
-        search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        
-        response = requests.get(
-            search_url, 
-            headers=headers, 
-            timeout=config.WEB_SEARCH_TIMEOUT
-        )
-        
-        if response.status_code != 200:
-            logger.warning(f"Web search returned status {response.status_code}")
-            return ""
-        
-        html = response.text
-        results = []
-        
-        # Extract snippets
-        snippet_pattern = r'<a class="result__snippet"[^>]*>(.*?)</a>'
-        snippets = re.findall(snippet_pattern, html, re.DOTALL)
-        
-        for snippet in snippets[:max_results]:
-            clean_snippet = re.sub(r'<[^>]+>', '', snippet).strip()
-            if clean_snippet:
-                results.append(f"• {clean_snippet}")
-        
-        if results:
-            logger.info(f"🌐 Web search found {len(results)} results for: {query[:50]}...")
-            return "\n".join(results)
-        
-        # Fallback to titles if no snippets
-        title_pattern = r'<a class="result__a"[^>]*>(.*?)</a>'
-        titles = re.findall(title_pattern, html, re.DOTALL)
-        
-        for title in titles[:max_results]:
-            clean_title = re.sub(r'<[^>]+>', '', title).strip()
-            if clean_title:
-                results.append(f"• {clean_title}")
-        
-        return "\n".join(results) if results else ""
-        
-    except requests.exceptions.Timeout:
-        logger.warning("Web search timed out")
-        return ""
-    except Exception as e:
-        logger.error(f"Web search error: {e}")
-        return ""
-
 
 # ============================================================================
 # SERVICE INITIALIZATION HELPERS
 # ============================================================================
 
-def wait_for_ollama(max_attempts: int = 30, delay: float = 2.0) -> bool:
-    """Wait for Ollama service to become available"""
-    logger.info("🔄 Checking Ollama service readiness...")
-    
-    for attempt in range(max_attempts):
-        try:
-            response = requests.get(
-                f"{config.OLLAMA_BASE_URL}/api/version", 
-                timeout=5
-            )
-            if response.status_code == 200:
-                version = response.json().get("version", "unknown")
-                logger.info(f"✅ Ollama service is ready (version: {version})")
-                return True
-        except requests.exceptions.RequestException:
-            pass
-        
-        logger.info(f"⏳ Waiting for Ollama... (attempt {attempt + 1}/{max_attempts})")
-        time.sleep(delay)
-    
-    logger.error("❌ Ollama service not ready after timeout")
-    return False
-
-
-def ensure_model(model_name: str) -> bool:
-    """Ensure the required LLM model is available, pulling if necessary"""
-    try:
-        logger.info(f"🔄 Checking for model: '{model_name}'")
-        
-        response = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=10)
-        response.raise_for_status()
-        
-        models = response.json().get("models", [])
-        available_names = {m.get("name", "") for m in models}
-        available_base = {m.get("name", "").split(":")[0] for m in models}
-        
-        base_name = model_name.split(":")[0]
-        
-        if model_name in available_names or base_name in available_base:
-            logger.info(f"✅ Model '{model_name}' is available")
-            return True
-        
-        logger.warning(f"⚠️ Model '{model_name}' not found, pulling...")
-        pull_response = requests.post(
-            f"{config.OLLAMA_BASE_URL}/api/pull",
-            json={"name": model_name},
-            timeout=1800  # 30 min timeout for large models
-        )
-        
-        if pull_response.status_code == 200:
-            logger.info(f"✅ Model '{model_name}' pulled successfully")
-            return True
-        
-        logger.error(f"❌ Failed to pull model: {pull_response.text}")
-        return False
-        
-    except Exception as e:
-        logger.error(f"🔥 Error ensuring model: {e}")
-        return False
-
-
 def test_database_connection() -> bool:
     """Test database connection and verify pgvector extension"""
+    conn = None
+    cur = None
     try:
         import psycopg2
         conn = psycopg2.connect(config.DATABASE_URL)
@@ -341,207 +123,24 @@ def test_database_connection() -> bool:
         # Check pgvector extension
         cur.execute("SELECT extname FROM pg_extension WHERE extname = 'vector';")
         if not cur.fetchone():
-            logger.error("❌ pgvector extension not found!")
+            logger.error("pgvector extension not found")
             return False
         
         # Get document count
         cur.execute("SELECT COUNT(*) FROM documents;")
         doc_count = cur.fetchone()[0]
         
-        logger.info(f"✅ Database connected. Documents: {doc_count}")
-        
-        cur.close()
-        conn.close()
+        logger.info("Database connected. Documents: %d", doc_count)
         return True
         
     except Exception as e:
-        logger.error(f"🔥 Database connection failed: {e}")
+        logger.error("Database connection failed: %s", e)
         return False
-
-
-# ============================================================================
-# FILE PROCESSING
-# ============================================================================
-
-def extract_text_from_file(file_content: bytes, filename: str, mime_type: str) -> str:
-    """
-    Extract text content from various file types.
-    
-    Supported formats:
-    - Text files (.txt)
-    - CSV files (.csv)
-    - JSON files (.json)
-    - PDF files (.pdf) - requires PyMuPDF or pdfplumber
-    - Word documents (.docx) - requires python-docx
-    - Images - requires pytesseract (OCR)
-    """
-    filename_lower = filename.lower()
-    
-    try:
-        # Plain text
-        if mime_type == "text/plain" or filename_lower.endswith(".txt"):
-            return file_content.decode("utf-8", errors="ignore")
-        
-        # CSV
-        if mime_type == "text/csv" or filename_lower.endswith(".csv"):
-            return file_content.decode("utf-8", errors="ignore")
-        
-        # JSON
-        if mime_type == "application/json" or filename_lower.endswith(".json"):
-            try:
-                data = json.loads(file_content.decode("utf-8"))
-                return json.dumps(data, indent=2, ensure_ascii=False)
-            except json.JSONDecodeError:
-                return file_content.decode("utf-8", errors="ignore")
-        
-        # PDF
-        if mime_type == "application/pdf" or filename_lower.endswith(".pdf"):
-            # Try PyMuPDF first (faster)
-            try:
-                import fitz
-                pdf_doc = fitz.open(stream=file_content, filetype="pdf")
-                text = "\n".join(page.get_text() for page in pdf_doc)
-                pdf_doc.close()
-                return text.strip()
-            except ImportError:
-                pass
-            
-            # Fallback to pdfplumber
-            try:
-                import pdfplumber
-                with pdfplumber.open(io.BytesIO(file_content)) as pdf:
-                    text = "\n".join(
-                        page.extract_text() or "" 
-                        for page in pdf.pages
-                    )
-                return text.strip()
-            except ImportError:
-                return "[Error: No PDF reader available. Install PyMuPDF or pdfplumber]"
-        
-        # Word documents
-        if filename_lower.endswith((".docx", ".doc")):
-            try:
-                from docx import Document
-                doc = Document(io.BytesIO(file_content))
-                text = "\n".join(para.text for para in doc.paragraphs)
-                return text.strip()
-            except ImportError:
-                return "[Error: python-docx not installed]"
-        
-        # Images (OCR)
-        if mime_type and mime_type.startswith("image"):
-            try:
-                image = Image.open(io.BytesIO(file_content))
-                text = pytesseract.image_to_string(image)
-                return text.strip()
-            except Exception as e:
-                return f"[Error reading image: {e}]"
-        
-        return f"[Unsupported file type: {mime_type or filename}]"
-        
-    except Exception as e:
-        logger.error(f"🔥 Error extracting text from {filename}: {e}")
-        return f"[Error reading file: {e}]"
-
-
-# ============================================================================
-# LLM INTERACTION
-# ============================================================================
-
-def build_system_prompt() -> str:
-    """Build the system prompt for the PLC Assistant"""
-    return """You are a knowledgeable PLC & Industrial Automation Assistant.
-
-EXPERTISE AREAS:
-• PLC Programming: Ladder Logic, Structured Text, Function Block Diagram, Instruction List, Sequential Function Chart
-• Industrial Protocols: Modbus (RTU/TCP), PROFINET, EtherNet/IP, OPC UA, PROFIBUS, CANopen, BACnet
-• Automation Systems: SCADA, HMI, DCS, MES integration
-• Motion Control: Servo drives, VFDs, stepper motors, positioning
-• Safety Systems: Safety PLCs, emergency stops, light curtains, IEC 61508/62443
-• Troubleshooting: Diagnostic techniques, error analysis, preventive maintenance
-
-RESPONSE GUIDELINES:
-1. Always respond in English, regardless of the input language
-2. Be precise and technical when discussing automation topics
-3. Include relevant specifications, standards, or protocols when applicable
-4. Provide step-by-step guidance for troubleshooting questions
-5. Mention safety considerations where relevant
-6. If you don't know something, say so clearly"""
-
-
-def ask_llm_directly(
-    llm,
-    question: str,
-    file_content: str = "",
-    filename: str = "",
-    mode: str = "fast",
-    chat_history: List[Dict] = None,
-    web_context: str = ""
-) -> Dict[str, Any]:
-    """
-    Send question directly to LLM without RAG.
-    Used for Fast mode responses.
-    """
-    start_time = time.perf_counter()
-    
-    # Build conversation history
-    history_str = ""
-    if chat_history:
-        for msg in chat_history[-10:]:  # Last 10 messages for context
-            role = "User" if msg.get("sender") == "user" else "Assistant"
-            text = msg.get("text", "")[:500]  # Truncate long messages
-            history_str += f"{role}: {text}\n"
-    
-    # Build file section
-    file_section = ""
-    if file_content:
-        max_chars = config.DEEP_MODE_CHARS if mode == "deep" else config.FAST_MODE_CHARS
-        truncated = len(file_content) > max_chars
-        content = file_content[:max_chars] if truncated else file_content
-        
-        file_section = f"""
-=== UPLOADED FILE: {filename} ===
-{content}
-{"[... content truncated ...]" if truncated else ""}
-==="""
-    
-    # Build web search section
-    web_section = ""
-    if web_context:
-        web_section = f"""
-=== WEB SEARCH RESULTS ===
-{web_context}
-==="""
-    
-    # Build the prompt
-    system_prompt = build_system_prompt()
-    
-    prompt = f"""{system_prompt}
-
-{"=== CONVERSATION HISTORY ===" + chr(10) + history_str + "===" if history_str else ""}
-{file_section}
-{web_section}
-
-USER QUESTION: {question}
-
-Provide a helpful, detailed response in English:"""
-
-    try:
-        response = llm.invoke(prompt)
-        elapsed = time.perf_counter() - start_time
-        
-        return {
-            "reply": response,
-            "processing_time": elapsed,
-            "mode": mode
-        }
-    except Exception as e:
-        logger.error(f"🔥 LLM error: {e}")
-        return {
-            "reply": f"I encountered an error processing your request: {str(e)}",
-            "processing_time": time.perf_counter() - start_time,
-            "mode": mode
-        }
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
 
 
 # ============================================================================
@@ -551,7 +150,7 @@ Provide a helpful, detailed response in English:"""
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager - handles startup and shutdown"""
-    logger.info("🚀 Starting application...")
+    logger.info("Starting application...")
     
     # Initialize database pool
     try:
@@ -559,44 +158,71 @@ async def lifespan(app: FastAPI):
             # init_db_pool() creates and returns SimpleConnectionPool as defined in backend/app/db.py
             db_pool = init_db_pool()
             app.state.db_pool = db_pool
-            logger.info("✅ Database connection pool created via init_db_pool()")
+            logger.info("Database connection pool initialized")
         else:
             app.state.db_pool = None
-            logger.error("❌ test_database_connection() failed — db_pool not created")
+            logger.error("test_database_connection() failed; DB pool not created")
     except Exception as e:
-        logger.error(f"🔥 Failed to initialize DB pool via init_db_pool(): {e}", exc_info=True)
+        logger.error("Failed to initialize DB pool via init_db_pool(): %s", e, exc_info=True)
         app.state.db_pool = None
     
-    # Initialize LLM
+    # Initialize LLM (Gemini)
     app.state.llm = None
-    if wait_for_ollama() and ensure_model(config.OLLAMA_MODEL):
-        try:
-            app.state.llm = OllamaLLM(
-                model=config.OLLAMA_MODEL,
-                base_url=config.OLLAMA_BASE_URL,
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        
+        logger.info("Initializing Gemini model: %s", config.GEMINI_MODEL)
+        
+        # Validate API key format before attempting to initialize
+        if not config.GEMINI_API_KEY or len(config.GEMINI_API_KEY) < 20:
+            logger.error("Invalid GEMINI_API_KEY format. Check your .env file.")
+            logger.warning("Server will start without LLM; chat functionality will be limited")
+        else:
+            app.state.llm = ChatGoogleGenerativeAI(
+                model=config.GEMINI_MODEL,
+                google_api_key=config.GEMINI_API_KEY,
                 temperature=config.LLM_TEMPERATURE,
                 timeout=config.LLM_TIMEOUT,
-                num_predict=config.LLM_NUM_PREDICT,  # Limit output tokens
+                max_tokens=config.LLM_NUM_PREDICT,
             )
             set_llm(app.state.llm)  # Share LLM with utils module
-            logger.info(f"✅ LLM loaded: {config.OLLAMA_MODEL} (max {config.LLM_NUM_PREDICT} tokens)")
-        except Exception as e:
-            logger.error(f"🔥 Failed to load LLM: {e}")
+            logger.info("Gemini loaded: %s (max %d tokens)", config.GEMINI_MODEL, config.LLM_NUM_PREDICT)
+    except ImportError:
+        logger.error("langchain-google-genai not installed. Run: pip install langchain-google-genai")
+    except Exception as e:
+        logger.error("Failed to load Gemini: %s", e)
+        logger.warning("Server will start without LLM; chat functionality will be limited")
     
     # Initialize embedder (use singleton from embed_logic)
     app.state.embedder = None
     try:
         app.state.embedder = get_embedder()
-        logger.info(f"✅ Embedder loaded: {config.EMBED_MODEL_NAME}")
+        logger.info("Embedder loaded: %s", config.EMBED_MODEL_NAME)
     except Exception as e:
-        logger.error(f"🔥 Failed to load embedder: {e}")
+        logger.error("Failed to load embedder: %s", e)
     
-    logger.info("🎉 Application startup complete")
+    # Log PDF Page Image Context mode
+    use_page_images = os.getenv("USE_PAGE_IMAGES", "false").lower() in ("true", "1", "yes")
+    if use_page_images:
+        logger.info("PDF Page Image Context: ENABLED (vision LLM mode)")
+    else:
+        logger.info("PDF Page Image Context: DISABLED (text-only mode)")
+    
+    # Initialize Whisper model for transcription (non-blocking)
+    app.state.whisper_model = None
+    logger.info("Whisper model will load lazily on first transcription request")
+    
+    logger.info("Application startup complete")
+
+    logger.debug("Registered routes:")
+    for route in app.routes:
+        if hasattr(route, "path"):
+            logger.debug("  - %s [%s]", route.path, ",".join(route.methods))
     
     yield  # Application runs here
     
     # Shutdown
-    logger.info("👋 Shutting down...")
+    logger.info("Shutting down...")
     if hasattr(app.state, 'db_pool') and app.state.db_pool:
         app.state.db_pool.closeall()
         logger.info("Database pool closed")
@@ -646,10 +272,18 @@ async def add_request_id(request: Request, call_next):
     request_id = str(uuid4())
     request.state.request_id = request_id
     
-    # Log request start
-    logger.info(f"[{request_id[:8]}] {request.method} {request.url.path}")
-    
+    start = time.perf_counter()
+    logger.info("[%s] %s %s", request_id[:8], request.method, request.url.path)
     response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000.0
+    logger.info(
+        "[%s] %s %s -> %s (%.1fms)",
+        request_id[:8],
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
     response.headers["X-Request-ID"] = request_id
     return response
 
@@ -697,23 +331,6 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ============================================================================
-# PYDANTIC MODELS
-# ============================================================================
-
-class ChatRequest(BaseModel):
-    message: str
-    collection: str = Field(default="plcnext")
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    processing_time: Optional[float] = None
-    retrieval_time: Optional[float] = None
-    context_count: Optional[int] = None
-    ragas: Optional[dict] = None
-
-
 class HealthResponse(BaseModel):
     status: str
     services: dict
@@ -724,10 +341,6 @@ class HealthResponse(BaseModel):
 # ============================================================================
 # API ENDPOINTS
 # ============================================================================
-
-@app.on_event("startup")
-def on_startup():
-    init_db_pool()
 
 @app.get("/", tags=["Info"])
 def root():
@@ -751,7 +364,6 @@ def root():
         "endpoints": {
             "health": "GET /health",
             "chat": "POST /api/chat",
-            "agent_chat": "POST /api/agent-chat",
             "stream": "POST /api/chat/stream",
             "transcribe": "POST /api/transcribe",
             "collections": "GET /api/collections",
@@ -766,7 +378,8 @@ def health_check(request: Request):
     services = {
         "database": False,
         "llm": False,
-        "embedder": False
+        "embedder": False,
+        "whisper": False
     }
     
     # Check database
@@ -778,11 +391,14 @@ def health_check(request: Request):
     except Exception:
         pass
     
-    # Check LLM and embedder
+    # Check LLM, embedder, and whisper
     services["llm"] = request.app.state.llm is not None
     services["embedder"] = request.app.state.embedder is not None
+    services["whisper"] = request.app.state.whisper_model is not None
     
-    status = "healthy" if all(services.values()) else "degraded"
+    # Whisper loads lazily and should not mark overall service as degraded.
+    core_services_ok = services["database"] and services["llm"] and services["embedder"]
+    status = "healthy" if core_services_ok else "degraded"
     
     return HealthResponse(
         status=status,
@@ -790,197 +406,10 @@ def health_check(request: Request):
         timestamp=time.strftime("%Y-%m-%d %H:%M:%S")
     )
 
-
-@app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
-def chat(
-    request: Request,
-    chat_request: ChatRequest,
-    current_user=Depends(get_current_user),
-):
-    db_pool = request.app.state.db_pool
-    llm = request.app.state.llm
-    embedder = request.app.state.embedder
-
-    if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
-    if not llm:
-        raise HTTPException(status_code=503, detail="LLM not available")
-    if not embedder:
-        raise HTTPException(status_code=503, detail="Embedder not available")
-
-    result = answer_question(
-        question=chat_request.message,   # Use message from request
-        db_pool=db_pool,
-        llm=llm,
-        embedder=embedder,
-        collection=chat_request.collection,
-        retriever_class=PostgresVectorRetriever,
-        reranker_class=EnhancedFlashrankRerankRetriever,
-    )
-
-    # NOTE: Chat history is handled by routes_chat.py when using /api/chat/sessions
-    # This endpoint is for stateless chat - no history saving needed here
-
-    return ChatResponse(**sanitize_json(result))
-
-
-@app.post("/api/agent-chat", tags=["Chat"])
-def agent_chat(
-    message: str = Form(""),
-    file: UploadFile = File(None),
-    mode: str = Form("fast"),
-    chat_history: str = Form("[]"),
-    log_eval: bool = Form(False),
-    enable_ragas: bool = Form(False),
-    fast_ragas: Optional[bool] = Form(None),
-    ground_truth: str = Form(""),
-    use_rerank: Any = Form(None),
-    use_rank: Any = Form(None),
-):
-    """
-    Advanced chat endpoint with mode selection and file support.
-    
-    Parameters:
-    - message: The user's question
-    - file: Optional file upload (PDF, images, etc.)
-    - mode: Response mode - "fast" or "deep"
-    - chat_history: JSON array of previous messages for context
-    """
-    start_time = time.perf_counter()
-    
-    # Parse chat history
-    try:
-        history = json.loads(chat_history) if chat_history else []
-    except json.JSONDecodeError:
-        history = []
-    
-    # Validate mode - only "fast" and "deep" allowed
-    if mode not in ["fast", "deep"]:
-        mode = "fast"
-    
-    logger.info(f"🎯 Request received - Mode: {mode}, Message: {message[:50]}...")
-    
-    # Process uploaded file
-    file_text = ""
-    if file:
-        file_content = file.file.read()
-        mime_type, _ = mimetypes.guess_type(file.filename)
-        
-        # Redirect audio files to transcription endpoint
-        if mime_type and mime_type.startswith("audio"):
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Please use /api/transcribe for audio files"}
-            )
-        
-        file_text = extract_text_from_file(file_content, file.filename, mime_type)
-        logger.info(f"📄 Extracted {len(file_text)} chars from {file.filename}")
-    
-    # ========================================
-    # FAST MODE - Direct LLM
-    # ========================================
-    if mode == "fast":
-        # Determine if web search would be helpful
-        web_context = ""
-        search_triggers = [
-            "latest", "current", "today", "news", "price",
-            "2024", "2025", "update", "release", "announce"
-        ]
-        
-        if any(trigger in message.lower() for trigger in search_triggers):
-            logger.info(f"🌐 Performing web search for: {message[:50]}...")
-            web_context = web_search(message)
-        
-        result = ask_llm_directly(
-            llm=app.state.llm,
-            question=message,
-            file_content=file_text,
-            filename=file.filename if file else "",
-            mode=mode,
-            chat_history=history,
-            web_context=web_context
-        )
-        
-        response = {
-            "reply": result.get("reply", ""),
-            "processing_time": time.perf_counter() - start_time,
-            "retrieval_time": 0,
-            "context_count": 0,
-            "contexts": [],
-            "mode": mode,
-            "web_searched": bool(web_context),
-            "file_processed": file.filename if file else None
-        }
-        
-        return JSONResponse(content=sanitize_json(response))
-    
-    # ========================================
-    # DEEP MODE - RAG Pipeline
-    # ========================================
-    
-    # Determine reranking strategy
-    parsed_rerank = to_bool(use_rerank) or to_bool(use_rank)
-    if parsed_rerank is None:
-        parsed_rerank = os.getenv("USE_RERANK_DEFAULT", "true").lower() in ("1", "true", "yes")
-    
-    reranker_cls = EnhancedFlashrankRerankRetriever if parsed_rerank else NoRerankRetriever
-    
-    # Build context from history
-    history_context = ""
-    if history:
-        for msg in history[-6:]:
-            role = "User" if msg.get("sender") == "user" else "Assistant"
-            history_context += f"{role}: {msg.get('text', '')[:200]}\n"
-    
-    # Prepare query
-    retrieval_query = message
-    if file_text:
-        max_chars = config.DEEP_MODE_CHARS
-        truncated = file_text[:max_chars] if len(file_text) > max_chars else file_text
-        retrieval_query = f"{message}\n\n--- File Content ({file.filename}) ---\n{truncated}"
-    
-    # Execute RAG pipeline
-    result = answer_question(
-        question=retrieval_query,
-        db_pool=app.state.db_pool,
-        llm=app.state.llm,
-        embedder=app.state.embedder,
-        collection=config.DEFAULT_COLLECTION,
-        retriever_class=PostgresVectorRetriever,
-        reranker_class=reranker_cls,
-    )
-    
-    contexts = result.get("contexts_list") or result.get("contexts") or []
-    reply_text = result.get("llm_answer", "") or result.get("reply", "")
-    
-    # Fallback if no relevant context found
-    if "could not find relevant" in reply_text.lower() or not reply_text.strip():
-        logger.info("⚠️ No relevant context in Deep mode, falling back to direct LLM")
-        result = ask_llm_directly(
-            llm=app.state.llm,
-            question=message,
-            file_content=file_text,
-            filename=file.filename if file else "",
-            mode=mode,
-            chat_history=history
-        )
-        reply_text = result.get("reply", "")
-    
-    total_time = time.perf_counter() - start_time
-    logger.info(f"📊 Deep mode completed in {total_time:.2f}s")
-    
-    response = {
-        "reply": reply_text,
-        "processing_time": total_time,
-        "retrieval_time": result.get("retrieval_time"),
-        "context_count": result.get("context_count"),
-        "contexts": contexts,
-        "mode": mode,
-        "use_rerank": parsed_rerank,
-        "file_processed": file.filename if file else None
-    }
-    
-    return JSONResponse(content=sanitize_json(response))
+# NOTE: /api/chat endpoint is defined in routes_chat.py (via chat_router)
+# It handles session-based chat with history. The router is included via:
+#     app.include_router(chat_router)
+# Do NOT add a duplicate /api/chat here as it would be overridden.
 
 
 @app.post("/api/transcribe", tags=["Audio"])
@@ -992,14 +421,33 @@ def transcribe(file: UploadFile = File(...)):
         from faster_whisper import WhisperModel
     except ImportError:
         raise HTTPException(
-            status_code=503, 
+            status_code=503,
             detail="Whisper not available. Install faster-whisper."
         )
     
-    # Use cached model for faster subsequent requests
+    # Lazy load model on first request (with persistent cache)
     if not hasattr(app.state, 'whisper_model') or app.state.whisper_model is None:
-        logger.info("Loading Whisper model (small.en)...")
-        app.state.whisper_model = WhisperModel("small.en", device="cpu", compute_type="float32")
+        # Define persistent model cache directory
+        model_cache_dir = os.path.join(os.path.dirname(__file__), "models", "whisper")
+        os.makedirs(model_cache_dir, exist_ok=True)
+        
+        logger.info("🎤 Loading Whisper model (base with int8 quantization)...")
+        logger.info(f"   Model cache: {model_cache_dir}")
+        
+        try:
+            app.state.whisper_model = WhisperModel(
+                "base",  # Good balance of speed and accuracy
+                device="cpu",
+                compute_type="int8",
+                download_root=model_cache_dir
+            )
+            logger.info("✅ Whisper model loaded and ready")
+        except Exception as e:
+            logger.error(f"🔥 Failed to load Whisper model: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Failed to load Whisper model: {str(e)}"
+            )
     
     # Save to temp file
     suffix = "." + file.filename.split('.')[-1]
@@ -1008,57 +456,18 @@ def transcribe(file: UploadFile = File(...)):
         tmp_path = tmp.name
     
     try:
-        segments, _ = app.state.whisper_model.transcribe(tmp_path, language="en", beam_size=1)
-        transcript = "".join(s.text for s in segments)
+        segments, _ = app.state.whisper_model.transcribe(
+            tmp_path,
+            language="en",
+            beam_size=1,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500)
+        )
+        transcript = " ".join(s.text for s in segments)
         return {"text": transcript.strip()}
     finally:
         # Cleanup temp file
-        import os
         os.unlink(tmp_path)
-
-
-@app.post("/api/chat-image", response_model=ChatResponse, tags=["Chat"])
-def chat_image(
-    request: Request,
-    file: UploadFile = File(...),
-    message: str = Form("")
-):
-    """Chat with an image using OCR"""
-    image_bytes = file.file.read()
-    image = Image.open(io.BytesIO(image_bytes))
-    ocr_text = pytesseract.image_to_string(image)
-    
-    combined_question = f"{message}\n\n[Image OCR Text]:\n{ocr_text}".strip()
-    
-    result = answer_question(
-        question=combined_question,
-        db_pool=request.app.state.db_pool,
-        llm=request.app.state.llm,
-        embedder=request.app.state.embedder,
-        collection=config.DEFAULT_COLLECTION,
-        retriever_class=PostgresVectorRetriever,
-        reranker_class=EnhancedFlashrankRerankRetriever,
-    )
-    
-    return ChatResponse(**sanitize_json(result))
-
-@app.get("/api/chat/history", tags=["Chat"])
-def chat_history(
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    current_user=Depends(get_current_user),
-):
-    history = get_chat_history(
-        user_id=current_user["id"],
-        limit=limit,
-        offset=offset,
-    )
-
-    return {
-        "user_id": current_user["id"],
-        "count": len(history),
-        "items": history,
-    }
 
 @app.get("/api/collections", tags=["Data"])
 def get_collections(request: Request):

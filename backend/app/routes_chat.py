@@ -1,8 +1,11 @@
+import json
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from app.chatbot import answer_question
+from app.chatbot import answer_question, stream_answer_question
 from app.routes_auth import get_current_user
 from app.chat_db import (
     create_chat_session,
@@ -12,7 +15,6 @@ from app.chat_db import (
     update_chat_session_title,
     delete_chat_session,
 )
-
 from app.db import get_db_pool
 from app.embed_logic import get_embedder
 from app.retriever import (
@@ -22,6 +24,7 @@ from app.retriever import (
 from app.utils import get_llm
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -32,6 +35,7 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[int] = None
     collection: str = "plcnext"
+    use_page_images: Optional[bool] = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -39,6 +43,15 @@ class CreateSessionRequest(BaseModel):
 
 class UpdateSessionRequest(BaseModel):
     title: str
+
+
+def _require_services(db_pool, llm, embedder):
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database service is unavailable")
+    if llm is None:
+        raise HTTPException(status_code=503, detail="LLM service is unavailable")
+    if embedder is None:
+        raise HTTPException(status_code=503, detail="Embedder service is unavailable")
 
 
 # =========================
@@ -53,13 +66,18 @@ def chat(
     db_pool = get_db_pool()
     llm = get_llm()
     embedder = get_embedder()
+    _require_services(db_pool, llm, embedder)
+
+    message = (payload.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message must not be empty")
 
     # 1) Create session if not provided
     if payload.session_id is None:
         session_id = create_chat_session(
             db_pool=db_pool,
             user_id=current_user["id"],
-            title=payload.message[:50],
+            title=message[:50],
         )
         chat_history = []  # New session, no history
     else:
@@ -74,12 +92,12 @@ def chat(
         db_pool=db_pool,
         session_id=session_id,
         role="user",
-        content=payload.message,
+        content=message,
     )
 
     # 3) Ask LLM with chat history for context
     result = answer_question(
-        question=payload.message,
+        question=message,
         db_pool=db_pool,
         llm=llm,
         embedder=embedder,
@@ -87,6 +105,7 @@ def chat(
         retriever_class=PostgresVectorRetriever,
         reranker_class=EnhancedFlashrankRerankRetriever,
         chat_history=chat_history,  # Pass conversation history
+        use_page_images_override=payload.use_page_images,
     )
 
     if "reply" not in result:
@@ -100,7 +119,13 @@ def chat(
         content=result["reply"],
         metadata={
             "processing_time": result.get("processing_time", 0.0),
-            "ragas": result.get("ragas"),
+            "sources": result.get("sources", []),
+            "source_details": result.get("source_details", []),
+            "ragas": result.get("ragas", {}),
+            "ragas_status": result.get("ragas_status", "disabled"),
+            "response_mode": result.get("response_mode", "text"),
+            "requested_mode": result.get("requested_mode", "text"),
+            "mode_fallback_reason": result.get("mode_fallback_reason"),
         },
     )
 
@@ -108,11 +133,20 @@ def chat(
         "session_id": session_id,
         "reply": result["reply"],
         "processing_time": result.get("processing_time", 0.0),
-        "ragas": result.get("ragas"),
+        "sources": result.get("sources", []),
+        "source_details": result.get("source_details", []),
+        "ragas": result.get("ragas", {}),
+        "response_mode": result.get("response_mode", "text"),
+        "requested_mode": result.get("requested_mode", "text"),
+        "mode_fallback_reason": result.get("mode_fallback_reason"),
         "metadata": {
             "retrieval_time": result.get("retrieval_time", 0.0),
             "context_count": result.get("context_count", 0),
             "max_score": result.get("max_score"),
+            "ragas_status": result.get("ragas_status", "disabled"),
+            "response_mode": result.get("response_mode", "text"),
+            "requested_mode": result.get("requested_mode", "text"),
+            "mode_fallback_reason": result.get("mode_fallback_reason"),
         },
     }
 
@@ -227,3 +261,98 @@ def get_messages(
         "has_more": result["has_more"],
         "items": result["items"],
     }
+
+
+@router.post("/stream")
+def chat_stream(
+    payload: ChatRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Streaming chat endpoint (SSE).
+    1. Yields JSON events (status, context, token, stats, done)
+    2. Saves message to DB after generation
+    """
+    db_pool = get_db_pool()
+    llm = get_llm()
+    embedder = get_embedder()
+    _require_services(db_pool, llm, embedder)
+
+    message = (payload.message or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message must not be empty")
+
+    # 1) Create session if needed
+    if payload.session_id is None:
+        session_id = create_chat_session(
+            db_pool=db_pool,
+            user_id=current_user["id"],
+            title=message[:50],
+        )
+        chat_history = []
+    else:
+        session_id = payload.session_id
+        result = get_chat_messages(db_pool, session_id, current_user["id"])
+        messages = result.get("items", []) if result else []
+        chat_history = [{"role": m["role"], "content": m["content"]} for m in messages[-10:]]
+
+    # 2) Save USER message
+    insert_chat_message(
+        db_pool=db_pool,
+        session_id=session_id,
+        role="user",
+        content=message,
+    )
+
+    # 3) Define generator wrapper to capture full reply for DB
+    def iter_response():
+        full_reply = ""
+        
+        # Generator from chatbot.py
+        gen = stream_answer_question(
+            question=message,
+            db_pool=db_pool,
+            llm=llm,
+            embedder=embedder,
+            collection=payload.collection,
+            retriever_class=PostgresVectorRetriever,
+            reranker_class=EnhancedFlashrankRerankRetriever,
+            chat_history=chat_history,
+            use_page_images_override=payload.use_page_images,
+        )
+
+        # Consumes generator
+        # Send session ID first
+        yield json.dumps({"type": "session", "id": session_id}) + "\n"
+        
+        for event_str in gen:
+            yield event_str + "\n"
+            
+            # Parse event to capture data
+            try:
+                event = json.loads(event_str)
+                if event["type"] == "token":
+                    full_reply += event["text"]
+                elif event["type"] == "stats":
+                    stats = event["data"]
+                    # 4) Save ASSISTANT message
+                    insert_chat_message(
+                        db_pool=db_pool,
+                        session_id=session_id,
+                        role="assistant",
+                        content=full_reply,
+                        metadata={
+                            "processing_time": stats.get("processing_time"),
+                            "sources": stats.get("sources", []),
+                            "source_details": stats.get("source_details", []),
+                            "ragas": stats.get("ragas", {}),
+                            "ragas_status": stats.get("ragas_status", "disabled"),
+                            "response_mode": stats.get("response_mode", "text"),
+                            "requested_mode": stats.get("requested_mode", "text"),
+                            "mode_fallback_reason": stats.get("mode_fallback_reason"),
+                        },
+                    )
+            except Exception:
+                logger.debug("Failed to parse stream event for persistence", exc_info=True)
+
+    return StreamingResponse(iter_response(), media_type="application/x-ndjson")

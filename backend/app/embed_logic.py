@@ -2,26 +2,31 @@ import os
 import re
 import json
 import logging
-from typing import List
+import threading
+from typing import List, Optional
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
-# Singleton embedder instance
+# Singleton embedder instance with thread-safe initialization
 _embedder = None
+_embedder_lock = threading.Lock()
 
 def get_embedder():
     """
-    Returns a singleton SentenceTransformer embedder.
+    Returns a thread-safe singleton SentenceTransformer embedder.
     Uses BAAI/bge-m3 model (matching embed.py and .env configuration).
     """
     global _embedder
     if _embedder is None:
-        model_name = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
-        cache_folder = os.getenv("MODEL_CACHE", "/app/models")
-        logging.info(f"[get_embedder] Loading embedder: {model_name}")
-        _embedder = SentenceTransformer(model_name, cache_folder=cache_folder)
-        logging.info("[get_embedder] Embedder loaded successfully")
+        with _embedder_lock:
+            # Double-check locking pattern
+            if _embedder is None:
+                model_name = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+                cache_folder = os.getenv("MODEL_CACHE", "/app/models")
+                logging.info(f"[get_embedder] Loading embedder: {model_name}")
+                _embedder = SentenceTransformer(model_name, cache_folder=cache_folder)
+                logging.info("[get_embedder] Embedder loaded successfully")
     return _embedder
 
 
@@ -85,11 +90,11 @@ def is_valid_chunk(chunk: Document) -> tuple[bool, str]:
     
     # 2. TABLE OF CONTENTS detection - REJECT these!
     # Pattern: "3.4.1 Something........... 45" or "Chapter 3....... 15"
-    if re.search(r'\d+\.\d+.*\.{3,}\s*\d+', content):
+    if _TOC_PATTERN.search(content):
         return False, "toc_entry"
     
     # TOC in markdown table format: "| Something ... | 15 |" or "| 3.1.6 [G] Expansion boards...48 |"
-    if re.search(r'\|.*\.{3,}.*\d+\s*\|', content):
+    if _TOC_TABLE_PATTERN.search(content):
         return False, "toc_table_entry"
     
     # Simple page reference patterns in tables: "| Standards | 15 |" with mostly numbers + short text
@@ -109,7 +114,13 @@ def is_valid_chunk(chunk: Document) -> tuple[bool, str]:
     if len(content_no_fillers) > 10:
         alpha_count = sum(1 for c in content_no_fillers if c.isalpha())
         alpha_ratio = alpha_count / len(content_no_fillers)
-        if alpha_ratio < 0.15:
+        
+        # Check if this looks like technical notation (device addresses, register names, etc.)
+        # Pattern: X0000, M8126, D0255, TN063, etc.
+        has_technical_pattern = bool(_TECHNICAL_DEVICE_PATTERN.search(content))
+        
+        # Allow low alpha ratio if it contains technical patterns
+        if alpha_ratio < 0.15 and not has_technical_pattern:
             return False, f"low_alpha ({alpha_ratio:.1%})"
     
     # 4. Excessive whitespace (>50%)
@@ -159,7 +170,7 @@ def get_file_label(source: str) -> str:
 def split_table_by_rows(table_text: str, max_chars: int = 800) -> List[str]:
     """
     Split a markdown table by rows while preserving headers.
-    Each chunk will have the header rows prepended.
+    Handles multi-line headers and missing separators.
     
     Args:
         table_text: Markdown table string
@@ -168,24 +179,28 @@ def split_table_by_rows(table_text: str, max_chars: int = 800) -> List[str]:
     Returns:
         List of table chunks, each with headers preserved
     """
-    lines = table_text.strip().split('\n')
+    lines = [l for l in table_text.strip().split('\n') if l.strip()]
     if len(lines) < 2:
         return [table_text]  # Not a valid table
     
-    # Find header and separator (first 2 lines typically)
-    # Header: | Col1 | Col2 |
-    # Separator: |------|------|
-    header_lines = []
-    data_lines = []
-    
+    # Find separator line (contains only |, -, and spaces)
+    separator_idx = None
     for i, line in enumerate(lines):
-        if i < 2 and ('|' in line):
-            header_lines.append(line)
-        elif '|' in line:
-            data_lines.append(line)
+        if re.match(r'^\s*\|[\s\-|]+\|\s*$', line):
+            separator_idx = i
+            break
     
-    if not header_lines:
-        return [table_text]  # No headers found, return as-is
+    if separator_idx is None:
+        # No separator found, treat first line as header
+        header_lines = [lines[0]]
+        data_lines = lines[1:]
+    else:
+        # Everything up to and including separator is header
+        header_lines = lines[:separator_idx + 1]
+        data_lines = lines[separator_idx + 1:]
+    
+    if not data_lines:
+        return [table_text]  # No data rows
     
     header_text = '\n'.join(header_lines)
     header_len = len(header_text) + 1  # +1 for newline
@@ -223,13 +238,10 @@ def extract_tables_and_prose(text: str) -> tuple[List[str], str]:
     Returns:
         (list of table strings, remaining prose text)
     """
-    # Pattern to match markdown tables (consecutive lines starting with |)
-    table_pattern = re.compile(r'((?:^\|.*\|$\n?)+)', re.MULTILINE)
-    
     tables = []
     prose = text
     
-    for match in table_pattern.finditer(text):
+    for match in _TABLE_PATTERN.finditer(text):
         table_text = match.group(1).strip()
         # Only consider it a table if it has at least 2 rows (header + data)
         if table_text.count('\n') >= 1 and '|' in table_text:
@@ -239,10 +251,121 @@ def extract_tables_and_prose(text: str) -> tuple[List[str], str]:
     return tables, prose
 
 
+# Centralized chunk defaults (read from env for consistency)
+DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+DEFAULT_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
+
+# Precompiled regex patterns for performance
+_KV_PATTERN = re.compile(r'^(?P<key>[A-Za-z0-9\(\)\/\s\.,-]{5,80}?)\s{2,}(?P<value>.+?)$', re.MULTILINE)
+_TABLE_PATTERN = re.compile(r'((?:^\|.*\|$\n?)+)', re.MULTILINE)
+_TOC_PATTERN = re.compile(r'\d+\.\d+.*\.{3,}\s*\d+')
+_TOC_TABLE_PATTERN = re.compile(r'\|.*\.{3,}.*\d+\s*\|')
+_TECHNICAL_DEVICE_PATTERN = re.compile(r'\b[A-Z]{1,3}\d{3,5}\b')  # X0000, M8126, etc.
+_PAGE_TOKEN_PATTERN = re.compile(r"[a-z0-9\-]{4,}", re.IGNORECASE)
+_PAGE_STOPWORDS = {
+    "with", "from", "that", "this", "only", "using", "into", "where", "which",
+    "unit", "series", "guide", "manual", "command", "data", "computer", "adapter",
+}
+
+
+def _normalize_for_match(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _resolve_pdf_path(source: str, pdf_path: Optional[str]) -> Optional[str]:
+    """Resolve PDF path from explicit arg or known data directories."""
+    if pdf_path and os.path.exists(pdf_path):
+        return pdf_path
+
+    filename = os.path.basename(source or "")
+    candidate_dirs = ["/app/data/Knowledge", "/app/data/knowledge", "./data/Knowledge", "./data/knowledge", ""]
+    for base_dir in candidate_dirs:
+        candidate = os.path.join(base_dir, filename) if base_dir else filename
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _build_pdf_page_texts(pdf_path: str) -> List[str]:
+    """Load and normalize each PDF page text (1-indexed list represented as 0-indexed array)."""
+    import fitz
+
+    pdf_doc = fitz.open(pdf_path)
+    try:
+        return [_normalize_for_match(pdf_doc[i].get_text()) for i in range(len(pdf_doc))]
+    finally:
+        pdf_doc.close()
+
+
+def _resolve_chunk_page(
+    chunk_text: str,
+    page_texts: List[str],
+    current_page: int,
+    fallback_page: int = 1
+) -> int:
+    """
+    Pick best-matching physical PDF page for a chunk with confidence guards.
+
+    fallback_page is used for weak/ambiguous matches when current_page is missing.
+    This prevents noisy chunks from collapsing to page 1 during full-document remaps.
+    """
+    if not page_texts:
+        return current_page if current_page > 0 else max(1, fallback_page)
+
+    max_page = len(page_texts)
+    fallback_page = max(1, min(fallback_page, max_page))
+
+    normalized_chunk = _normalize_for_match(chunk_text)
+    if not normalized_chunk:
+        return current_page if current_page > 0 else fallback_page
+
+    tokens = []
+    for tok in _PAGE_TOKEN_PATTERN.findall(normalized_chunk):
+        if tok not in _PAGE_STOPWORDS:
+            tokens.append(tok)
+    if not tokens:
+        return current_page if current_page > 0 else fallback_page
+    tokens = tokens[:50]
+
+    scores = [sum(1 for tok in tokens if tok in page_text) for page_text in page_texts]
+    best_idx = max(range(len(scores)), key=lambda i: scores[i])
+    best_score = scores[best_idx]
+    best_page = best_idx + 1
+    sorted_scores = sorted(scores, reverse=True)
+    second_best = sorted_scores[1] if len(sorted_scores) > 1 else 0
+
+    # Keep current page if confidence is similar to prevent noisy remaps.
+    if 1 <= current_page <= len(scores):
+        current_score = scores[current_page - 1]
+        if current_score >= best_score - 1:
+            return current_page
+
+    # If we don't have a trusted current page, keep sequence continuity
+    # for weak or ambiguous matches.
+    if current_page <= 0:
+        if best_score < 6:
+            return fallback_page
+        if (best_score - second_best) <= 1:
+            fallback_score = scores[fallback_page - 1]
+            if fallback_score >= best_score - 1:
+                return fallback_page
+        # Avoid noisy backward jumps unless clearly better than fallback.
+        if best_page < fallback_page:
+            fallback_score = scores[fallback_page - 1]
+            if best_score <= fallback_score + 1:
+                return fallback_page
+
+    # Guard against weak matches.
+    if best_score < 6:
+        return current_page if current_page > 0 else fallback_page
+    return best_page
+
+
 def create_pdf_chunks(
     docs: List[Document],
-    chunk_size: int = 800,
-    chunk_overlap: int = 150
+    chunk_size: int = None,
+    chunk_overlap: int = None,
+    pdf_path: str = None
 ) -> List[Document]:
     """
     Create chunks from Docling-extracted documents with filtering.
@@ -250,12 +373,14 @@ def create_pdf_chunks(
     
     Args:
         docs: List of Document objects from Docling
-        chunk_size: Maximum characters per chunk (default: 800)
-        chunk_overlap: Overlap between chunks (default: 150)
+        chunk_size: Maximum characters per chunk (default from CHUNK_SIZE env var)
+        chunk_overlap: Overlap between chunks (default from CHUNK_OVERLAP env var)
+        pdf_path: Path to source PDF file (for page assignment if needed)
     """
+    chunk_size = chunk_size if chunk_size is not None else DEFAULT_CHUNK_SIZE
+    chunk_overlap = chunk_overlap if chunk_overlap is not None else DEFAULT_CHUNK_OVERLAP
     all_chunks = []
     filtered_count = 0
-    kv_pattern = re.compile(r'^(?P<key>[A-Za-z0-9\(\)\/\s\.,-]{5,80}?)\s{2,}(?P<value>.+?)$', re.MULTILINE)
     
     # Configurable chunk settings
     text_splitter = RecursiveCharacterTextSplitter(
@@ -268,13 +393,16 @@ def create_pdf_chunks(
         page_content = doc.page_content
         page_metadata = doc.metadata or {}
         source = page_metadata.get('source', 'unknown')
-        # Note: Docling with MARKDOWN export doesn't provide per-page metadata
-        # Page will be 0 for all chunks. Use DOC_CHUNKS export type for page info.
+        # Get page number from metadata (may be 0 if not available)
         page_number = page_metadata.get('page', 0)
         file_label = get_file_label(source)
         
+        # Log warning for page=0 but continue processing
+        if page_number == 0:
+            logging.debug(f"⚠️ Chunk from {source} has page=0 (will assign after chunking)")
+        
         # Key-Value Extraction Logic
-        kv_matches = kv_pattern.findall(page_content)
+        kv_matches = _KV_PATTERN.findall(page_content)
         for key, value in kv_matches:
             key_clean = key.strip()
             value_clean = value.strip()
@@ -292,7 +420,7 @@ def create_pdf_chunks(
             is_garbage = is_section_header or bool(is_step_instruction)
             
             if combined_len > 25 and value_has_content and not is_garbage:
-                kv_content = f"{file_label}: {key_clean}: {value_clean}"
+                kv_content = f"{key_clean}: {value_clean}"
                 kv_chunk = Document(
                     page_content=kv_content,
                     metadata=enhance_metadata(
@@ -301,14 +429,14 @@ def create_pdf_chunks(
                     )
                 )
                 # Apply filtering
-                is_valid, reason = is_valid_chunk(kv_chunk)
+                is_valid, _ = is_valid_chunk(kv_chunk)
                 if is_valid:
                     all_chunks.append(kv_chunk)
                 else:
                     filtered_count += 1
         
-        # Remove extracted key-value pairs from content using regex
-        remaining_content = kv_pattern.sub('', page_content)
+        # Remove extracted key-value pairs from content using precompiled regex
+        remaining_content = _KV_PATTERN.sub('', page_content)
         
         # === TABLE-AWARE SPLITTING ===
         # Extract tables and process them separately with row-based splitting
@@ -318,15 +446,14 @@ def create_pdf_chunks(
         for table in tables:
             table_chunks = split_table_by_rows(table, max_chars=chunk_size)
             for table_chunk_text in table_chunks:
-                labeled_content = f"{file_label}: {table_chunk_text}"
                 table_chunk = Document(
-                    page_content=labeled_content,
+                    page_content=table_chunk_text,
                     metadata=enhance_metadata(
                         {"source": os.path.basename(source), "page": page_number, "chunk_type": "table"},
-                        labeled_content
+                        table_chunk_text
                     )
                 )
-                is_valid, reason = is_valid_chunk(table_chunk)
+                is_valid, _ = is_valid_chunk(table_chunk)
                 if is_valid:
                     all_chunks.append(table_chunk)
                 else:
@@ -339,40 +466,102 @@ def create_pdf_chunks(
         if prose_content and len(prose_content.strip()) > 50:
             prose_chunks = text_splitter.create_documents([prose_content])
             for chunk in prose_chunks:
-                # Prepend file label to chunk content
-                labeled_content = f"{file_label}: {chunk.page_content}"
-                chunk.page_content = labeled_content
                 chunk.metadata = enhance_metadata(
                     {"source": os.path.basename(source), "page": page_number, "chunk_type": "prose"},
-                    labeled_content
+                    chunk.page_content
                 )
                 # Apply filtering
-                is_valid, reason = is_valid_chunk(chunk)
+                is_valid, _ = is_valid_chunk(chunk)
                 if is_valid:
                     all_chunks.append(chunk)
                 else:
                     filtered_count += 1
 
+    # Always validate/remap pages against physical PDF text to prevent metadata drift.
+    if all_chunks:
+        first_source = all_chunks[0].metadata.get('source', 'unknown')
+        resolved_pdf_path = _resolve_pdf_path(first_source, pdf_path)
+        if resolved_pdf_path:
+            try:
+                page_texts = _build_pdf_page_texts(resolved_pdf_path)
+                remapped_count = 0
+                inferred_count = 0
+                last_resolved_by_type = {}
+                for chunk in all_chunks:
+                    old_page = int(chunk.metadata.get("page", 0) or 0)
+                    chunk_type = chunk.metadata.get("chunk_type", "unknown")
+                    fallback_page = last_resolved_by_type.get(chunk_type, 1)
+                    new_page = _resolve_chunk_page(
+                        chunk.page_content,
+                        page_texts,
+                        old_page,
+                        fallback_page=fallback_page
+                    )
+                    if old_page <= 0:
+                        inferred_count += 1
+                    if new_page != old_page:
+                        remapped_count += 1
+                    chunk.metadata["page"] = new_page
+                    last_resolved_by_type[chunk_type] = new_page
+
+                page_counts = {}
+                for chunk in all_chunks:
+                    p = int(chunk.metadata.get("page", 1) or 1)
+                    page_counts[p] = page_counts.get(p, 0) + 1
+
+                logging.info(
+                    f"📊 Page validation complete: remapped={remapped_count}/{len(all_chunks)} "
+                    f"(inferred_from_missing={inferred_count})"
+                )
+                logging.info(f"   Distribution across {len(page_texts)} pages: {dict(sorted(page_counts.items()))}")
+            except Exception as e:
+                logging.warning(f"⚠️ Failed page validation/remap for {first_source}: {e}")
+        else:
+            logging.warning(f"⚠️ Could not locate PDF for page validation: {first_source}")
+
     logging.info(f"✅ Created {len(all_chunks)} chunks (filtered out {filtered_count} trash chunks)")
+    
+    # Log chunk type distribution
+    chunk_types = {}
+    for chunk in all_chunks:
+        ctype = chunk.metadata.get('chunk_type', 'unknown')
+        chunk_types[ctype] = chunk_types.get(ctype, 0) + 1
+    
+    if chunk_types:
+        logging.info(f"   Chunk types: {dict(sorted(chunk_types.items()))}")
+    
     return all_chunks
 
 
 def create_json_qa_chunks(file_path: str) -> List[Document]:
-    """Create chunks from JSON QA file"""
+    """
+    Create chunks from JSON QA file.
+
+    Supports both schemas:
+    - {"question": "...", "answer": "..."}
+    - {"reference_question": "...", "reference_answer": "..."}
+    """
     chunks = []
-    file_label = get_file_label(file_path)
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             qa_pairs = json.load(f)
+
+        skipped = 0
         for pair in qa_pairs:
-            # Prepend file label for consistency with PDF chunks
-            content = f"{file_label}: Question: {pair.get('question', '')}\nAnswer: {pair.get('answer', '')}"
+            question = (pair.get("question") or pair.get("reference_question") or "").strip()
+            answer = (pair.get("answer") or pair.get("reference_answer") or "").strip()
+
+            if not question or not answer:
+                skipped += 1
+                continue
+
+            content = f"Question: {question}\nAnswer: {answer}"
             metadata = enhance_metadata(
                 {"source": os.path.basename(file_path), "chunk_type": "golden_qa"},
                 content
             )
             chunks.append(Document(page_content=content, metadata=metadata))
-        logging.info(f"✅ Created {len(chunks)} chunks from Golden QA Set.")
+        logging.info("✅ Created %d chunks from Golden QA Set (skipped %d invalid rows).", len(chunks), skipped)
     except Exception as e:
         logging.error(f"🔥 Failed to process JSON file {file_path}: {e}")
     return chunks

@@ -6,7 +6,7 @@ An AI-powered chatbot for **industrial automation** and **PLCnext** technical su
 
 - **RAG-Powered Answers** - Retrieves information from embedded documents for accurate responses
 - **Multi-Input Support** - Text, and voice (Whisper)
-- **Local LLM** - Runs offline with LLaMA 3.2 via Ollama (no API costs)
+- **Gemini LLM Backend** - Uses Google Gemini via LangChain
 - **GPU Accelerated** - NVIDIA GPU support for 5-10x faster responses
 
 ## Tech Stack
@@ -16,7 +16,7 @@ An AI-powered chatbot for **industrial automation** and **PLCnext** technical su
 | Frontend | React + Vite + TailwindCSS |
 | Backend | FastAPI (Python) |
 | Database | PostgreSQL + pgvector |
-| LLM | Ollama (LLaMA 3.2) |
+| LLM | Google Gemini (LangChain) |
 | Embeddings | BAAI/bge-m3 |
 | Deployment | Docker Compose |
 
@@ -40,9 +40,6 @@ cp .env.example .env
 # 3. Start all services
 docker compose up -d
 
-# 4. Pull required LLM models
-docker compose exec ollama ollama pull llama3.2
-docker compose exec ollama ollama pull phi3:mini
 ```
 
 ### Access
@@ -116,13 +113,24 @@ docker compose down
 docker compose down -v
 ```
 
+## Optional RAGAS Check
+
+If you want `context_precision` and `context_recall` (ground-truth evaluation):
+
+```bash
+docker compose exec backend pip install -r requirements-ragas.txt
+docker compose exec backend python -m app.ragas_ground_truth_eval \
+  --question "Your question here" \
+  --ground-truth "Reference answer here"
+```
+
 ## Environment Variables
 
 Key settings in `.env`:
 
 ```env
 # LLM
-OLLAMA_MODEL=llama3.2
+GEMINI_MODEL=gemini-1.5-flash
 LLM_TEMPERATURE=0.7
 
 # Embeddings

@@ -1,7 +1,7 @@
 """
-Backward-compatible chatbot module.
+Chat pipeline package.
 
-Public entry points are re-exported from the split chat pipeline package.
+Exports stable public entry points for the RAG chatbot flow.
 """
 
 from app.chat.pipeline import answer_question, stream_answer_question

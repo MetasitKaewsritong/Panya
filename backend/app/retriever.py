@@ -10,7 +10,6 @@ from langchain_core.documents import Document
 
 from pgvector.psycopg2 import register_vector
 import psycopg2  # noqa: F401 (used with connection_pool)
-import numpy as np  # noqa: F401 (for type checking in some cases)
 
 # flashrank is optional - falls back to base score if not available
 try:
@@ -21,6 +20,7 @@ except Exception:
 
 # Singleton ranker instance for performance
 _ranker_instance = None
+logger = logging.getLogger(__name__)
 
 def _get_ranker():
     """Get or create singleton Ranker instance."""
@@ -29,7 +29,7 @@ def _get_ranker():
         model = os.getenv("RERANK_MODEL", "ms-marco-MiniLM-L-12-v2")
         cache_dir = os.getenv("MODEL_CACHE", "/app/models")
         _ranker_instance = Ranker(model_name=model, cache_dir=cache_dir)
-        logging.info(f"[Ranker] Initialized: {model}")
+        logger.info("[Ranker] Initialized: %s", model)
     return _ranker_instance
 
 
@@ -52,6 +52,54 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except Exception:
+        return default
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _distance_to_similarity(distance: float) -> float:
+    """
+    Convert pgvector L2 distance to bounded similarity in [0, 1].
+    This is safer than `1 - distance`, which can become negative.
+    """
+    try:
+        d = max(0.0, float(distance))
+    except Exception:
+        d = 1.0
+    return 1.0 / (1.0 + d)
+
+
+# ===============================
+# Reranking Boost Configuration
+# ===============================
+class RerankBoostConfig:
+    """Centralized configuration for reranking boost values."""
+    
+    # Domain-specific boosts
+    PLC_TERM_BOOST = _env_float("RERANK_BOOST_PLC_TERM", 0.10)
+    QUERY_TOKEN_BOOST = _env_float("RERANK_BOOST_QUERY_TOKEN", 0.20)
+    PROTOCOL_TERM_BOOST_PER_HIT = _env_float("RERANK_BOOST_PROTOCOL_PER_HIT", 0.08)
+    PROTOCOL_TERM_BOOST_MAX = _env_float("RERANK_BOOST_PROTOCOL_MAX", 0.30)
+    
+    # Chunk type boosts
+    # Keep this modest so Golden QA helps, but does not dominate all retrieval.
+    GOLDEN_QA_BOOST = _env_float("RERANK_BOOST_GOLDEN_QA", 0.35)
+    SPEC_PAIR_BOOST = _env_float("RERANK_BOOST_SPEC_PAIR", 0.15)
+
+    # Error/event code boost
+    ERROR_CODE_BOOST = _env_float("RERANK_BOOST_ERROR_CODE", 2.0)
+    MAX_TOTAL_BOOST = _env_float("RERANK_BOOST_MAX_TOTAL", 1.5)
+
+
 # ===============================
 # Base Vector Retriever (pgvector)
 # ===============================
@@ -66,6 +114,7 @@ class PostgresVectorRetriever(BaseRetriever):
     embedder: Any = Field(...)
     collection: str = Field(default="plcnext")
     limit: int = Field(default_factory=lambda: _env_int("RETRIEVE_LIMIT", 50))
+    include_golden_qa: bool = Field(default_factory=lambda: _env_bool("RETRIEVE_INCLUDE_GOLDEN_QA", False))
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
         # SentenceTransformer embedder returns numpy.ndarray
@@ -75,16 +124,29 @@ class PostgresVectorRetriever(BaseRetriever):
         try:
             register_vector(conn)
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT content, metadata, embedding <-> %s AS distance
-                    FROM documents
-                    WHERE collection = %s
-                    ORDER BY embedding <-> %s
-                    LIMIT %s
-                    """,
-                    (query_vector, self.collection, query_vector, self.limit),
-                )
+                if self.include_golden_qa:
+                    cur.execute(
+                        """
+                        SELECT content, metadata, embedding <-> %s AS distance
+                        FROM documents
+                        WHERE collection = %s
+                        ORDER BY embedding <-> %s
+                        LIMIT %s
+                        """,
+                        (query_vector, self.collection, query_vector, self.limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT content, metadata, embedding <-> %s AS distance
+                        FROM documents
+                        WHERE collection = %s
+                          AND COALESCE(metadata->>'chunk_type', '') <> 'golden_qa'
+                        ORDER BY embedding <-> %s
+                        LIMIT %s
+                        """,
+                        (query_vector, self.collection, query_vector, self.limit),
+                    )
                 rows = cur.fetchall()
 
             docs: List[Document] = []
@@ -95,7 +157,7 @@ class PostgresVectorRetriever(BaseRetriever):
             return docs
 
         except Exception as e:
-            logging.error("🔥 Error in PostgresVectorRetriever: %s", e, exc_info=True)
+            logger.error("Error in PostgresVectorRetriever: %s", e, exc_info=True)
             return []
         finally:
             self.connection_pool.putconn(conn)
@@ -145,14 +207,15 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
                     sc = float(it.get("score", it.get("relevance_score")))
                     pairs.append((sc, docs[idx]))
             except Exception as e:
-                logging.warning("⚠️ Flashrank failed, fallback to base scores: %s", e)
-                pairs = [(1.0 - float(d.metadata.get("distance", 1.0)), d) for d in docs]
+                logger.warning("Flashrank failed, using distance-based fallback scores: %s", e)
+                pairs = [(_distance_to_similarity(d.metadata.get("distance", 1.0)), d) for d in docs]
         else:
-            pairs = [(1.0 - float(d.metadata.get("distance", 1.0)), d) for d in docs]
+            pairs = [(_distance_to_similarity(d.metadata.get("distance", 1.0)), d) for d in docs]
 
         # 2) Apply domain-specific boosts (soft + capped)
         boosted: List[Tuple[float, Document]] = []
-        q_tokens = (query or "").lower().split()
+        q_tokens = [tok for tok in (query or "").lower().split() if len(tok) > 2]
+        q_token_set = set(q_tokens)
         query_upper = (query or "").upper()
         
         # Extract error/event codes from query (pattern: letter + numbers + H, e.g., F800H, 9801H)
@@ -169,21 +232,29 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
                 chunk_codes = set(code_pattern.findall(text_upper))
                 matching_codes = query_codes & chunk_codes
                 if matching_codes:
-                    bonus += 2.0  # Strong boost for exact code match
+                    bonus += RerankBoostConfig.ERROR_CODE_BOOST
             
             if any(w in text_low for w in self._PLC_TERMS):
-                bonus += 0.10
-            if any(tok in text_low for tok in q_tokens if tok and len(tok) > 2):
-                bonus += 0.20
+                bonus += RerankBoostConfig.PLC_TERM_BOOST
+            if q_token_set:
+                matched = sum(1 for tok in q_token_set if tok in text_low)
+                if matched > 0:
+                    # Partial match scoring: scales bonus by token coverage ratio.
+                    coverage = matched / len(q_token_set)
+                    bonus += RerankBoostConfig.QUERY_TOKEN_BOOST * coverage
             proto_hits = sum(1 for t in self._PROTO_TERMS if t in text_low)
             if proto_hits > 0:
-                bonus += min(0.30, proto_hits * 0.08)  # cap 0.30
+                bonus += min(
+                    RerankBoostConfig.PROTOCOL_TERM_BOOST_MAX,
+                    proto_hits * RerankBoostConfig.PROTOCOL_TERM_BOOST_PER_HIT
+                )
             ctype = (d.metadata or {}).get("chunk_type")
             if ctype == "golden_qa":
-                bonus += 10.0
+                bonus += RerankBoostConfig.GOLDEN_QA_BOOST
             elif ctype == "spec_pair":
-                bonus += 0.15
-            boosted.append((s + bonus, d))
+                bonus += RerankBoostConfig.SPEC_PAIR_BOOST
+            bounded_bonus = min(RerankBoostConfig.MAX_TOTAL_BOOST, bonus)
+            boosted.append((s + bounded_bonus, d))
 
         boosted.sort(key=lambda x: x[0], reverse=True)
         return boosted
@@ -203,19 +274,3 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
             doc.metadata["score"] = score
             results.append(doc)
         return results
-
-
-# ===============================
-# No-op Reranker (for A/B testing)
-# ===============================
-class NoRerankRetriever(BaseRetriever):
-    """
-    No reranking - passes through results from base_retriever and truncates to Top-N.
-    """
-    base_retriever: BaseRetriever = Field(...)
-    top_n: int = Field(default=8)
-
-    def _get_relevant_documents(self, query: str) -> List[Document]:
-        # Use invoke() instead of deprecated get_relevant_documents()
-        docs = self.base_retriever.invoke(query) or []
-        return docs[: self.top_n]

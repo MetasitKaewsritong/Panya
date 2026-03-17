@@ -1,203 +1,142 @@
 """
-Process Golden QA data for RAGAS evaluation
-File: backend/app/process_golden_qa.py
+Batch question runner for smoke-checking retrieval/generation quality.
+
+This replaces the older RAGAS+Golden-QA evaluator with a lightweight flow:
+- Read questions from a JSON file
+- Ask the chatbot for each question
+- Save answers + timing metadata
+
+Input JSON can use either:
+- {"question": "..."}
+- {"reference_question": "..."}
 """
 
+from __future__ import annotations
+
+import argparse
 import json
 import os
-import sys
-import time
-from typing import List, Dict, Any
 from pathlib import Path
+from typing import Any, Dict, List
 
-# Add app to path
-sys.path.append('/app')
+from psycopg2 import pool
+from sentence_transformers import SentenceTransformer
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Import dependencies
-from app.ragas_eval import local_ragas_eval
 from app.chatbot import answer_question
 from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever
 
-# Import from main for dependencies
-from sentence_transformers import SentenceTransformer
-from langchain_ollama import OllamaLLM
-from psycopg2 import pool
 
-def load_golden_qa(filepath: str) -> List[Dict[str, Any]]:
-    """Load golden QA pairs from JSON file"""
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return json.load(f)
+def load_questions(filepath: str) -> List[str]:
+    with open(filepath, "r", encoding="utf-8") as f:
+        rows = json.load(f)
+
+    questions: List[str] = []
+    for row in rows:
+        q = (row.get("question") or row.get("reference_question") or "").strip()
+        if q:
+            questions.append(q)
+    return questions
+
 
 def setup_dependencies():
-    """Setup database pool, LLM, and embedder"""
-    DB_URL = os.getenv("DATABASE_URL")
-    if not DB_URL:
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
         raise RuntimeError("DATABASE_URL environment variable is required.")
-    
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-    OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
-    EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
-    
-    # Setup database pool
+
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is required.")
+
     db_pool = pool.SimpleConnectionPool(
-        1, 10,
-        dsn=DB_URL,
-        keepalives=1,
-        keepalives_idle=30,
-        keepalives_interval=10,
-        keepalives_count=5
+        minconn=int(os.getenv("DB_POOL_MIN", "1")),
+        maxconn=int(os.getenv("DB_POOL_MAX", "10")),
+        dsn=db_url,
     )
-    
-    # Setup LLM
-    llm = OllamaLLM(
-        model=OLLAMA_MODEL,
-        base_url=OLLAMA_BASE_URL,
-        temperature=0.0,
-        timeout=60
+
+    llm = ChatGoogleGenerativeAI(
+        model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        google_api_key=gemini_api_key,
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
+        timeout=int(os.getenv("LLM_TIMEOUT", "30")),
     )
-    
-    # Setup embedder
+
     embedder = SentenceTransformer(
-        EMBED_MODEL_NAME,
-        cache_folder='/app/models'
+        os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
+        cache_folder=os.getenv("MODEL_CACHE", "/app/models"),
     )
-    
+
     return db_pool, llm, embedder
 
-def run_batch_evaluation(golden_qa_file: str, output_file: str):
-    """
-    Run RAGAS evaluation on entire golden dataset
-    """
-    print(f"Loading Golden QA from: {golden_qa_file}")
-    
-    # Load golden QA
-    if not os.path.exists(golden_qa_file):
-        print(f"Error: File not found: {golden_qa_file}")
-        return
-    
-    golden_qa = load_golden_qa(golden_qa_file)
-    print(f"Loaded {len(golden_qa)} questions")
-    
-    # Setup dependencies
-    print("Setting up dependencies...")
+
+def run_batch_questions(input_file: str, output_file: str, collection: str = "plcnext") -> List[Dict[str, Any]]:
+    questions = load_questions(input_file)
+    if not questions:
+        raise RuntimeError(f"No valid questions found in {input_file}")
+
     db_pool, llm, embedder = setup_dependencies()
-    
-    results = []
-    
-    for i, item in enumerate(golden_qa):
-        print(f"Evaluating {i+1}/{len(golden_qa)}: {item['question'][:50]}...")
-        
-        try:
-            start_time = time.time()
-            
-            # Get chatbot answer
-            chat_result = answer_question(
-                question=item["question"],
+    results: List[Dict[str, Any]] = []
+
+    try:
+        total = len(questions)
+        for i, question in enumerate(questions, start=1):
+            print(f"[{i}/{total}] {question[:80]}")
+            result = answer_question(
+                question=question,
                 db_pool=db_pool,
                 llm=llm,
                 embedder=embedder,
-                collection="plcnext",
+                collection=collection,
                 retriever_class=PostgresVectorRetriever,
-                reranker_class=EnhancedFlashrankRerankRetriever
+                reranker_class=EnhancedFlashrankRerankRetriever,
             )
-            
-            # Run RAGAS evaluation
-            ragas_result = local_ragas_eval(
-                question=item["question"],
-                answer=chat_result["reply"],
-                contexts=chat_result.get("contexts", [])
+            results.append(
+                {
+                    "question_id": i - 1,
+                    "question": question,
+                    "answer": result.get("reply", ""),
+                    "timing": {
+                        "processing_time": result.get("processing_time"),
+                        "retrieval_time": result.get("retrieval_time"),
+                        "rerank_time": result.get("rerank_time"),
+                        "llm_time": result.get("llm_time"),
+                    },
+                    "sources": result.get("sources", []),
+                }
             )
-            
-            # Combine results
-            evaluation_result = {
-                "question_id": i,
-                "category": item.get("category", "general"),
-                "question": item["question"],
-                "ground_truth": item["answer"],
-                "predicted_answer": chat_result["reply"],
-                "retrieval_time": chat_result.get("retrieval_time"),
-                "context_count": chat_result.get("context_count"),
-                "ragas_scores": ragas_result.get("scores", {}),
-                "ragas_status": ragas_result.get("status"),
-                "ragas_judge_type": ragas_result.get("judge_type"),
-                "total_evaluation_time": time.time() - start_time
-            }
-            
-            results.append(evaluation_result)
-            
-        except Exception as e:
-            print(f"Error evaluating item {i+1}: {e}")
-            results.append({
-                "question_id": i,
-                "question": item["question"],
-                "error": str(e)
-            })
-    
-    # Clean up
-    if db_pool:
+    finally:
         db_pool.closeall()
-    
-    # Save results
-    with open(output_file, 'w', encoding='utf-8') as f:
+
+    out_path = Path(output_file)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    
-    print(f"Batch evaluation completed. Results saved to {output_file}")
+
+    print(f"Saved {len(results)} responses to {output_file}")
     return results
 
-def analyze_results(results_file: str):
-    """Analyze RAGAS evaluation results"""
-    with open(results_file, 'r', encoding='utf-8') as f:
-        results = json.load(f)
-    
-    # Calculate average scores
-    metrics = ["answer_relevancy", "faithfulness", "context_precision", "context_recall"]
-    avg_scores = {}
-    
-    for metric in metrics:
-        scores = []
-        for r in results:
-            if "ragas_scores" in r and r["ragas_scores"]:
-                score = r["ragas_scores"].get(metric)
-                if score is not None and isinstance(score, (int, float)):
-                    scores.append(float(score))
-        
-        if scores:
-            avg_scores[metric] = {
-                "average": sum(scores) / len(scores),
-                "min": min(scores),
-                "max": max(scores),
-                "count": len(scores)
-            }
-    
-    print("RAGAS Evaluation Results Summary:")
-    print("=" * 50)
-    for metric, stats in avg_scores.items():
-        print(f"{metric}:")
-        print(f"  Average: {stats['average']:.3f}")
-        print(f"  Range: {stats['min']:.3f} - {stats['max']:.3f}")
-        print(f"  Valid samples: {stats['count']}/{len(results)}")
-        print()
-    
-    # Count by status
-    status_counts = {}
-    for r in results:
-        status = r.get("ragas_status", "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
-    
-    print("Evaluation Status:")
-    for status, count in status_counts.items():
-        print(f"  {status}: {count}")
-    
-    return avg_scores
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run a batch of questions through the chatbot.")
+    parser.add_argument(
+        "--input",
+        default="/app/data/Knowledge/golden_qa.json",
+        help="Input JSON containing question rows",
+    )
+    parser.add_argument(
+        "--output",
+        default="/app/evaluation_results.json",
+        help="Output JSON file path",
+    )
+    parser.add_argument(
+        "--collection",
+        default=os.getenv("DEFAULT_COLLECTION", "plcnext"),
+        help="Document collection to query",
+    )
+    return parser
+
 
 if __name__ == "__main__":
-    # Usage
-    golden_qa_path = "/app/data/Knowledge/golden_qa.json"
-    output_path = "/app/ragas_evaluation_results.json"
-    
-    print("Starting batch RAGAS evaluation...")
-    results = run_batch_evaluation(golden_qa_path, output_path)
-    
-    if results:
-        print("\nAnalyzing results...")
-        analyze_results(output_path)
+    args = _build_arg_parser().parse_args()
+    run_batch_questions(args.input, args.output, args.collection)
+

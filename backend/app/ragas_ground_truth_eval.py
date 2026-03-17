@@ -1,0 +1,156 @@
+"""
+Optional offline RAGAS evaluator for ground-truth checks.
+
+This script is intentionally separate from runtime chat.
+It evaluates context_precision/context_recall using Gemini as judge LLM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from typing import Dict, Any, List
+
+from psycopg2 import pool
+from sentence_transformers import SentenceTransformer
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+from app.chatbot import answer_question
+from app.chat.selection import select_context_docs
+from app.chat.text_utils import preprocess_query
+from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever
+
+
+def _setup_runtime():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL environment variable is required.")
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is required.")
+
+    db_pool = pool.SimpleConnectionPool(
+        minconn=int(os.getenv("DB_POOL_MIN", "1")),
+        maxconn=int(os.getenv("DB_POOL_MAX", "10")),
+        dsn=db_url,
+    )
+
+    llm = ChatGoogleGenerativeAI(
+        model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        google_api_key=api_key,
+        temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
+        timeout=int(os.getenv("LLM_TIMEOUT", "30")),
+    )
+
+    embedder = SentenceTransformer(
+        os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
+        cache_folder=os.getenv("MODEL_CACHE", "/app/models"),
+    )
+    return db_pool, llm, embedder
+
+
+def _get_selected_contexts(question: str, db_pool, embedder, collection: str) -> List[str]:
+    base = PostgresVectorRetriever(
+        connection_pool=db_pool,
+        embedder=embedder,
+        collection=collection,
+    )
+    reranker = EnhancedFlashrankRerankRetriever(base_retriever=base)
+    docs = reranker.invoke(preprocess_query(question)) or []
+    selected, _ = select_context_docs(docs)
+    return [d.page_content for d in selected]
+
+
+def evaluate_two_metrics(
+    question: str,
+    ground_truth: str,
+    collection: str = "plcnext",
+) -> Dict[str, Any]:
+    try:
+        from datasets import Dataset
+        from ragas import evaluate
+        from ragas.metrics import context_precision, context_recall
+        from langchain_huggingface import HuggingFaceEmbeddings
+    except Exception as e:
+        raise RuntimeError(
+            "RAGAS deps are not installed. Install optional deps first: "
+            "pip install -r backend/requirements-ragas.txt"
+        ) from e
+
+    db_pool, llm, embedder = _setup_runtime()
+    try:
+        chat_result = answer_question(
+            question=question,
+            db_pool=db_pool,
+            llm=llm,
+            embedder=embedder,
+            collection=collection,
+            retriever_class=PostgresVectorRetriever,
+            reranker_class=EnhancedFlashrankRerankRetriever,
+        )
+        answer = chat_result.get("reply", "")
+        contexts = _get_selected_contexts(question, db_pool, embedder, collection)
+
+        ragas_embeddings = HuggingFaceEmbeddings(
+            model_name=os.getenv("RAGAS_EMBED_MODEL_EVAL", "sentence-transformers/all-MiniLM-L6-v2"),
+            cache_folder=os.getenv("MODEL_CACHE", "/app/models"),
+        )
+
+        data = {
+            "question": [question],
+            "answer": [answer],
+            "contexts": [contexts],
+            "ground_truth": [ground_truth],
+        }
+        dataset = Dataset.from_dict(data)
+
+        result = evaluate(
+            dataset=dataset,
+            metrics=[context_precision, context_recall],
+            llm=llm,
+            embeddings=ragas_embeddings,
+        )
+
+        if hasattr(result, "to_pandas"):
+            df = result.to_pandas()
+            row = df.iloc[0].to_dict() if df is not None and not df.empty else {}
+        else:
+            row = {}
+
+        return {
+            "question": question,
+            "ground_truth": ground_truth,
+            "answer": answer,
+            "context_count": len(contexts),
+            "context_precision": float(row.get("context_precision")) if row.get("context_precision") is not None else None,
+            "context_recall": float(row.get("context_recall")) if row.get("context_recall") is not None else None,
+        }
+    finally:
+        db_pool.closeall()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Evaluate context_precision/context_recall with Gemini + ground truth.")
+    parser.add_argument("--question", required=True, help="Question to evaluate")
+    parser.add_argument("--ground-truth", required=True, help="Reference answer for recall/precision evaluation")
+    parser.add_argument("--collection", default=os.getenv("DEFAULT_COLLECTION", "plcnext"), help="Vector collection name")
+    parser.add_argument("--output", default="", help="Optional output JSON file path")
+    return parser
+
+
+if __name__ == "__main__":
+    args = _build_parser().parse_args()
+    report = evaluate_two_metrics(
+        question=args.question,
+        ground_truth=args.ground_truth,
+        collection=args.collection,
+    )
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f"Saved report to {args.output}")
+    else:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+

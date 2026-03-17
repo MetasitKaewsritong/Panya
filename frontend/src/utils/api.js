@@ -65,11 +65,12 @@ export const chatAPI = {
     deleteSession: (sessionId) =>
         api.delete(`/api/chat/sessions/${sessionId}`),
 
-    transcribe: (audioBlob) => {
+    transcribe: (audioBlob, signal = null) => {
         const formData = new FormData();
         formData.append('file', audioBlob, 'recording.webm');
         return api.post('/api/transcribe', formData, {
             headers: { 'Content-Type': 'multipart/form-data' },
+            signal: signal,
         });
     },
 };

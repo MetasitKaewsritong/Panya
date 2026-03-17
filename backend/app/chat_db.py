@@ -128,7 +128,7 @@ def insert_chat_message(
 ):
     """
     role: 'user' | 'assistant'
-    metadata: optional dict with processing_time, ragas scores, etc.
+    metadata: optional dict with processing_time, sources, etc.
     """
     conn = db_pool.getconn()
     try:
