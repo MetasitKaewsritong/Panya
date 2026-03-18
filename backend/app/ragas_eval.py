@@ -42,6 +42,9 @@ RAGAS_LLM_PROVIDER = os.getenv("RAGAS_LLM_PROVIDER", "gemini")
 RAGAS_LLM_MODEL = os.getenv("RAGAS_LLM_MODEL", os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
 RAGAS_TIMEOUT = int(os.getenv("RAGAS_TIMEOUT", "30"))
 RAGAS_MAX_WORKERS = max(1, _env_int("RAGAS_MAX_WORKERS", 1))
+# Reusing a single chat client across async evaluation loops can trigger
+# "attached to a different loop" runtime errors in some provider stacks.
+RAGAS_REUSE_LLM = _env_bool("RAGAS_REUSE_LLM", False)
 RAGAS_METRIC_KEYS = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
 
 _ragas_llm = None
@@ -52,9 +55,23 @@ _ground_truth_map: Dict[str, Tuple[str, str]] = {}
 _ground_truth_loaded = False
 _ground_truth_lock = threading.Lock()
 
+_MANUAL_SCOPE_PREFIX_RE = re.compile(
+    r"^\s*(?:for|in|from)\s+[^:]{0,180}\bmanual\b\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_manual_scope_prefix(text: str) -> str:
+    """Remove leading 'For <manual> manual:' scoping so lookup keys still match."""
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    stripped = _MANUAL_SCOPE_PREFIX_RE.sub("", raw, count=1).strip()
+    return stripped or raw
+
 
 def _normalize_question(text: str) -> str:
-    text = (text or "").strip().lower()
+    text = _strip_manual_scope_prefix(text).lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text
@@ -254,30 +271,34 @@ def format_scores(scores: Dict[str, float]) -> str:
 
 def _get_ragas_llm():
     global _ragas_llm
-    if _ragas_llm is not None:
+    if RAGAS_REUSE_LLM and _ragas_llm is not None:
         return _ragas_llm
 
     if RAGAS_LLM_PROVIDER == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
 
-        _ragas_llm = ChatGoogleGenerativeAI(
+        llm = ChatGoogleGenerativeAI(
             model=RAGAS_LLM_MODEL,
             google_api_key=os.getenv("GEMINI_API_KEY"),
             temperature=float(os.getenv("RAGAS_LLM_TEMPERATURE", "0.0")),
             timeout=RAGAS_TIMEOUT,
         )
-        return _ragas_llm
+        if RAGAS_REUSE_LLM:
+            _ragas_llm = llm
+        return llm
 
     if RAGAS_LLM_PROVIDER == "openai":
         from langchain_openai import ChatOpenAI
 
-        _ragas_llm = ChatOpenAI(
+        llm = ChatOpenAI(
             model=RAGAS_LLM_MODEL,
             api_key=os.getenv("OPENAI_API_KEY"),
             temperature=float(os.getenv("RAGAS_LLM_TEMPERATURE", "0.0")),
             timeout=RAGAS_TIMEOUT,
         )
-        return _ragas_llm
+        if RAGAS_REUSE_LLM:
+            _ragas_llm = llm
+        return llm
 
     raise ValueError(f"Unsupported RAGAS_LLM_PROVIDER: {RAGAS_LLM_PROVIDER}")
 

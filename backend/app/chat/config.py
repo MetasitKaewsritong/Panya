@@ -12,5 +12,12 @@ class RAGConfig:
     MAX_CANDIDATES = int(os.getenv("RAG_MAX_CANDIDATES", "5"))
 
 
-USE_PAGE_IMAGES = os.getenv("USE_PAGE_IMAGES", "false").lower() in ("true", "1", "yes")
+def _env_bool(key: str, default: bool = False) -> bool:
+    value = os.getenv(key)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
+
+USE_PAGE_IMAGES = os.getenv("USE_PAGE_IMAGES", "false").lower() in ("true", "1", "yes")
+VISION_STRICT_MODE = _env_bool("VISION_STRICT_MODE", False)

@@ -2,6 +2,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from typing import List
 
@@ -9,7 +10,7 @@ from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 
-from app.chat.config import USE_PAGE_IMAGES
+from app.chat.config import USE_PAGE_IMAGES, VISION_STRICT_MODE
 from app.chat.logging_utils import log_chat_request
 from app.chat.prompts import build_enhanced_prompt, build_no_context_prompt, build_vision_prompt
 from app.chat.scoring import get_doc_score
@@ -26,6 +27,88 @@ from app.chat.text_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MANUAL_SCOPE_RE = re.compile(
+    r"^\s*(?:for|in|from)\s+(.{1,180}?)\s+manual\s*:\s*",
+    re.IGNORECASE,
+)
+_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_SCOPE_STOPWORDS = {
+    "for",
+    "manual",
+    "the",
+    "and",
+    "or",
+    "guide",
+    "user",
+    "series",
+}
+
+
+def _extract_manual_scope(question: str) -> str | None:
+    match = _MANUAL_SCOPE_RE.match(question or "")
+    if not match:
+        return None
+    scope = (match.group(1) or "").strip()
+    return scope or None
+
+
+def _normalize_tokens(text: str) -> set[str]:
+    tokens = {
+        token.lower()
+        for token in _TOKEN_RE.findall((text or "").lower())
+        if token and token not in _SCOPE_STOPWORDS
+    }
+    return tokens
+
+
+def _source_matches_scope(scope: str, source: str) -> bool:
+    scope_norm = " ".join((scope or "").lower().split())
+    source_norm = " ".join((source or "").lower().split())
+    if not scope_norm or not source_norm:
+        return False
+
+    # Explicit manual families first.
+    if "a series" in scope_norm:
+        return "a series" in source_norm
+    if any(token in scope_norm for token in ("fx0n", "fx", "485adp", "melsec-f")):
+        return "fx" in source_norm or "melsec-f" in source_norm or "485adp" in source_norm
+
+    scope_tokens = _normalize_tokens(scope_norm)
+    source_tokens = _normalize_tokens(source_norm)
+    if not scope_tokens or not source_tokens:
+        return False
+
+    overlap = scope_tokens.intersection(source_tokens)
+    return len(overlap) >= 1
+
+
+def _filter_retrieved_docs_by_scope(question: str, docs: List) -> List:
+    scope = _extract_manual_scope(question)
+    if not scope or not docs:
+        return docs
+
+    matched = []
+    for doc in docs:
+        source = (doc.metadata or {}).get("source", "")
+        if _source_matches_scope(scope, source):
+            matched.append(doc)
+
+    if matched:
+        logger.info(
+            "[SCOPE_FILTER] scope='%s' matched=%d/%d",
+            scope,
+            len(matched),
+            len(docs),
+        )
+        return matched
+
+    logger.warning(
+        "[SCOPE_FILTER] scope='%s' matched=0/%d; keeping unfiltered retrieval",
+        scope,
+        len(docs),
+    )
+    return docs
 
 
 def _has_primary_ragas_scores(scores: dict) -> bool:
@@ -44,6 +127,7 @@ def answer_question(
     reranker_class,
     chat_history: List[dict] = None,
     use_page_images_override: bool | None = None,
+    ragas_ground_truth: str | None = None,
 ) -> dict:
     processed_msg = preprocess_query((question or "").strip())
     if not processed_msg:
@@ -60,6 +144,7 @@ def answer_question(
     )
     reranker = reranker_class(base_retriever=base_retriever)
     retrieved_docs = reranker.invoke(processed_msg) or []
+    retrieved_docs = _filter_retrieved_docs_by_scope(question, retrieved_docs)
     retrieval_time = time.perf_counter() - t_retrieval_start
 
     t_rerank_start = time.perf_counter()
@@ -75,12 +160,19 @@ def answer_question(
     t_llm_start = time.perf_counter()
     reply = None
     use_page_images = USE_PAGE_IMAGES if use_page_images_override is None else bool(use_page_images_override)
+    strict_vision = use_page_images and VISION_STRICT_MODE
     requested_mode = "vision" if use_page_images else "text"
     use_image_mode = use_page_images and selected_docs
     mode_fallback_reason = "no_selected_docs" if use_page_images and not selected_docs else None
     page_images_for_ragas = None
 
-    if use_image_mode:
+    if strict_vision and not selected_docs:
+        logger.warning("[VISION_MODE] strict mode with no selected docs; returning vision no-context response")
+        reply = "I couldn't find relevant pages for this vision request."
+        use_image_mode = True
+        mode_fallback_reason = None
+
+    if use_image_mode and not (strict_vision and not selected_docs and reply):
         try:
             from app.context_prep import prepare_page_context
 
@@ -110,21 +202,38 @@ def answer_question(
                 reply = extract_text_from_llm_response(response)
 
                 if is_not_found_response(reply) and context_texts:
-                    logger.warning("Vision returned 'not found'; falling back to text context")
-                    use_image_mode = False
-                    mode_fallback_reason = "vision_not_found"
+                    if strict_vision:
+                        logger.warning("[VISION_MODE] strict mode keeps vision not-found response")
+                        use_image_mode = True
+                        mode_fallback_reason = None
+                    else:
+                        logger.warning("Vision returned 'not found'; falling back to text context")
+                        use_image_mode = False
+                        mode_fallback_reason = "vision_not_found"
                 else:
                     logger.info("Sent %d page images to vision LLM", len(page_images))
                     use_image_mode = True
             else:
-                logger.warning("No page images found, falling back to text context")
-                use_image_mode = False
-                mode_fallback_reason = "no_page_images"
+                if strict_vision:
+                    logger.warning("[VISION_MODE] strict mode with no page images")
+                    reply = "I couldn't load page images for this vision request."
+                    use_image_mode = True
+                    mode_fallback_reason = None
+                else:
+                    logger.warning("No page images found, falling back to text context")
+                    use_image_mode = False
+                    mode_fallback_reason = "no_page_images"
         except Exception as e:
-            logger.error("Image context preparation failed: %s", e)
-            logger.warning("Falling back to text context")
-            use_image_mode = False
-            mode_fallback_reason = "vision_prepare_error"
+            if strict_vision:
+                logger.error("[VISION_MODE] strict mode preparation failure: %s", e)
+                reply = "I couldn't prepare page images for this vision request."
+                use_image_mode = True
+                mode_fallback_reason = None
+            else:
+                logger.error("Image context preparation failed: %s", e)
+                logger.warning("Falling back to text context")
+                use_image_mode = False
+                mode_fallback_reason = "vision_prepare_error"
 
     if not use_image_mode:
         if context_texts:
@@ -149,14 +258,15 @@ def answer_question(
                 | llm
                 | StrOutputParser()
             )
-        try:
-            reply = call_llm_with_retry(lambda: chain.invoke(processed_msg))
-        except Exception as e:
-            logger.error("[TEXT_MODE] Non-stream invoke failed: %s", e)
-            reply = (
-                "I can't generate a response right now because the model service is temporarily unavailable "
-                "(often quota or rate-limit related). Please retry in a bit."
-            )
+        if reply is None:
+            try:
+                reply = call_llm_with_retry(lambda: chain.invoke(processed_msg))
+            except Exception as e:
+                logger.error("[TEXT_MODE] Non-stream invoke failed: %s", e)
+                reply = (
+                    "I can't generate a response right now because the model service is temporarily unavailable "
+                    "(often quota or rate-limit related). Please retry in a bit."
+                )
 
     reply = fix_markdown_tables(reply)
     llm_time = time.perf_counter() - t_llm_start
@@ -202,7 +312,7 @@ def answer_question(
                 question=question,
                 answer=reply,
                 contexts=ragas_contexts,
-                ground_truth=None,
+                ground_truth=ragas_ground_truth,
             )
             if ENABLE_BACKGROUND_RAGAS:
                 ragas_status = "pending"
@@ -254,6 +364,7 @@ def stream_answer_question(
     reranker_class,
     chat_history: List[dict] = None,
     use_page_images_override: bool | None = None,
+    ragas_ground_truth: str | None = None,
 ):
     """
     Generator that yields:
@@ -282,6 +393,7 @@ def stream_answer_question(
     )
     reranker = reranker_class(base_retriever=base_retriever)
     retrieved_docs = reranker.invoke(processed_msg) or []
+    retrieved_docs = _filter_retrieved_docs_by_scope(question, retrieved_docs)
     retrieval_time = time.perf_counter() - t_retrieval_start
 
     t_rerank_start = time.perf_counter()
@@ -350,6 +462,7 @@ def stream_answer_question(
     t_llm_start = time.perf_counter()
     full_reply = ""
     use_page_images = USE_PAGE_IMAGES if use_page_images_override is None else bool(use_page_images_override)
+    strict_vision = use_page_images and VISION_STRICT_MODE
     requested_mode = "vision" if use_page_images else "text"
     use_image_mode = use_page_images and selected_docs
     mode_fallback_reason = "no_selected_docs" if use_page_images and not selected_docs else None
@@ -361,7 +474,14 @@ def stream_answer_question(
         use_image_mode,
     )
 
-    if use_image_mode:
+    if strict_vision and not selected_docs:
+        logger.warning("[VISION_MODE] strict mode with no selected docs; returning vision no-context response")
+        full_reply = "I couldn't find relevant pages for this vision request."
+        yield json.dumps({"type": "token", "text": full_reply})
+        use_image_mode = True
+        mode_fallback_reason = None
+
+    if use_image_mode and not (strict_vision and not selected_docs and full_reply):
         logger.info("[VISION_MODE] Preparing page images")
         try:
             from app.context_prep import prepare_page_context
@@ -410,10 +530,20 @@ def stream_answer_question(
                     response = call_llm_with_retry(lambda: llm.invoke([message]))
                     full_reply = extract_text_from_llm_response(response)
                     if is_not_found_response(full_reply) and context_texts:
-                        logger.warning("[VISION_MODE] returned not-found; fallback=text")
-                        use_image_mode = False
-                        full_reply = ""
-                        mode_fallback_reason = "vision_not_found"
+                        if strict_vision:
+                            logger.warning("[VISION_MODE] strict mode keeps vision not-found response")
+                            if full_reply:
+                                chunk_size = 50
+                                for i in range(0, len(full_reply), chunk_size):
+                                    chunk = full_reply[i : i + chunk_size]
+                                    yield json.dumps({"type": "token", "text": chunk})
+                            use_image_mode = True
+                            mode_fallback_reason = None
+                        else:
+                            logger.warning("[VISION_MODE] returned not-found; fallback=text")
+                            use_image_mode = False
+                            full_reply = ""
+                            mode_fallback_reason = "vision_not_found"
                     else:
                         logger.info("[VISION_MODE] success response_length=%d", len(full_reply))
                         if full_reply:
@@ -427,18 +557,39 @@ def stream_answer_question(
                             yield json.dumps({"type": "token", "text": error_msg})
                         use_image_mode = True
                 except Exception as e:
-                    logger.error("[VISION_MODE] failed error='%s' fallback=text", e)
-                    use_image_mode = False
-                    full_reply = ""
-                    mode_fallback_reason = "vision_invoke_error"
+                    if strict_vision:
+                        logger.error("[VISION_MODE] strict mode invoke error='%s'", e)
+                        full_reply = "I couldn't process the page images right now. Please retry vision mode."
+                        yield json.dumps({"type": "token", "text": full_reply})
+                        use_image_mode = True
+                        mode_fallback_reason = None
+                    else:
+                        logger.error("[VISION_MODE] failed error='%s' fallback=text", e)
+                        use_image_mode = False
+                        full_reply = ""
+                        mode_fallback_reason = "vision_invoke_error"
             else:
-                logger.warning("[VISION_MODE] no_images_available fallback=text")
-                use_image_mode = False
-                mode_fallback_reason = "no_page_images"
+                if strict_vision:
+                    logger.warning("[VISION_MODE] strict mode no_images_available")
+                    full_reply = "I couldn't load page images for this vision request."
+                    yield json.dumps({"type": "token", "text": full_reply})
+                    use_image_mode = True
+                    mode_fallback_reason = None
+                else:
+                    logger.warning("[VISION_MODE] no_images_available fallback=text")
+                    use_image_mode = False
+                    mode_fallback_reason = "no_page_images"
         except Exception as e:
-            logger.error("[VISION_MODE] preparation_failed error='%s' fallback=text", e)
-            use_image_mode = False
-            mode_fallback_reason = "vision_prepare_error"
+            if strict_vision:
+                logger.error("[VISION_MODE] strict mode preparation_failed error='%s'", e)
+                full_reply = "I couldn't prepare page images for this vision request."
+                yield json.dumps({"type": "token", "text": full_reply})
+                use_image_mode = True
+                mode_fallback_reason = None
+            else:
+                logger.error("[VISION_MODE] preparation_failed error='%s' fallback=text", e)
+                use_image_mode = False
+                mode_fallback_reason = "vision_prepare_error"
 
     if not use_image_mode:
         logger.info("[TEXT_MODE] chunks=%d", len(context_texts))
@@ -521,7 +672,7 @@ def stream_answer_question(
                 question=question,
                 answer=full_reply,
                 contexts=ragas_contexts,
-                ground_truth=None,
+                ground_truth=ragas_ground_truth,
             )
             if ENABLE_BACKGROUND_RAGAS:
                 ragas_status = "pending"

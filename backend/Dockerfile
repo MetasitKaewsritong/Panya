@@ -12,9 +12,9 @@ ENV PIP_DEFAULT_TIMEOUT=1000 \
     UVICORN_LOOP=asyncio \
     ANYIO_BACKEND=asyncio
 
-COPY requirements.txt ./
+COPY requirements.txt requirements-ragas.txt ./
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --retries 5 --timeout 1000 --no-cache-dir -r requirements.txt
+    pip install --retries 5 --timeout 1000 --no-cache-dir -r requirements.txt -r requirements-ragas.txt
 
 COPY . .
 

@@ -36,6 +36,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[int] = None
     collection: str = "plcnext"
     use_page_images: Optional[bool] = None
+    ragas_ground_truth: Optional[str] = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -106,6 +107,7 @@ def chat(
         reranker_class=EnhancedFlashrankRerankRetriever,
         chat_history=chat_history,  # Pass conversation history
         use_page_images_override=payload.use_page_images,
+        ragas_ground_truth=payload.ragas_ground_truth,
     )
 
     if "reply" not in result:
@@ -319,6 +321,7 @@ def chat_stream(
             reranker_class=EnhancedFlashrankRerankRetriever,
             chat_history=chat_history,
             use_page_images_override=payload.use_page_images,
+            ragas_ground_truth=payload.ragas_ground_truth,
         )
 
         # Consumes generator

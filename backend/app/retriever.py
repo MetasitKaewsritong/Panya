@@ -94,6 +94,9 @@ class RerankBoostConfig:
     # Keep this modest so Golden QA helps, but does not dominate all retrieval.
     GOLDEN_QA_BOOST = _env_float("RERANK_BOOST_GOLDEN_QA", 0.35)
     SPEC_PAIR_BOOST = _env_float("RERANK_BOOST_SPEC_PAIR", 0.15)
+    COMMAND_TABLE_BOOST = _env_float("RERANK_BOOST_COMMAND_TABLE", 0.45)
+    COMMAND_TOKEN_BOOST = _env_float("RERANK_BOOST_COMMAND_TOKEN", 0.60)
+    COMMAND_HINT_BOOST = _env_float("RERANK_BOOST_COMMAND_HINT", 0.25)
 
     # Error/event code boost
     ERROR_CODE_BOOST = _env_float("RERANK_BOOST_ERROR_CODE", 2.0)
@@ -214,9 +217,23 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
 
         # 2) Apply domain-specific boosts (soft + capped)
         boosted: List[Tuple[float, Document]] = []
-        q_tokens = [tok for tok in (query or "").lower().split() if len(tok) > 2]
+        # Keep two-letter command tokens (e.g., BR/BW) while filtering noisy stopwords.
+        raw_tokens = re.findall(r"[a-z0-9]+", (query or "").lower())
+        two_char_allowlist = {"br", "bw", "wr", "ww", "rr", "rq", "st", "fx"}
+        two_char_stopwords = {"an", "as", "at", "by", "do", "if", "in", "is", "it", "of", "on", "or", "to"}
+        q_tokens = [
+            tok
+            for tok in raw_tokens
+            if len(tok) > 2 or (len(tok) == 2 and tok in two_char_allowlist and tok not in two_char_stopwords)
+        ]
         q_token_set = set(q_tokens)
         query_upper = (query or "").upper()
+        query_low = (query or "").lower()
+        command_tokens = {tok for tok in q_token_set if tok in {"br", "bw", "wr", "ww", "rr", "rq"}}
+        command_query = bool(command_tokens) or any(
+            phrase in query_low
+            for phrase in ("computer command", "ascii code", "bit read", "bit write", "objective device")
+        )
         
         # Extract error/event codes from query (pattern: letter + numbers + H, e.g., F800H, 9801H)
         code_pattern = re.compile(r'\b[A-F0-9]{4,5}H\b', re.IGNORECASE)
@@ -253,6 +270,15 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
                 bonus += RerankBoostConfig.GOLDEN_QA_BOOST
             elif ctype == "spec_pair":
                 bonus += RerankBoostConfig.SPEC_PAIR_BOOST
+
+            if command_query:
+                if ctype == "table":
+                    bonus += RerankBoostConfig.COMMAND_TABLE_BOOST
+                if command_tokens and any(re.search(rf"\b{re.escape(tok)}\b", text_low) for tok in command_tokens):
+                    bonus += RerankBoostConfig.COMMAND_TOKEN_BOOST
+                if "objective device symbol" in text_low or "command" in text_low:
+                    bonus += RerankBoostConfig.COMMAND_HINT_BOOST
+
             bounded_bonus = min(RerankBoostConfig.MAX_TOTAL_BOOST, bonus)
             boosted.append((s + bounded_bonus, d))
 

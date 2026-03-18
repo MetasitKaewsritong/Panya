@@ -8,12 +8,11 @@ psycopg2-binary==2.9.9
 pgvector==0.2.5
 
 # ---- LangChain stack
-langchain>=0.2.0
-langchain-community>=0.2.0
-langchain-core>=0.2.0
+langchain==0.3.28
+langchain-community==0.3.31
+langchain-core==0.3.83
 langchain-google-genai==2.0.4
-langchain-text-splitters
-langgraph
+langchain-text-splitters==0.3.11
 flashrank
 sentence-transformers
 requests

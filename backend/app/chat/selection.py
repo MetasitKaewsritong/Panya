@@ -19,7 +19,7 @@ def select_context_docs(retrieved_docs: List, max_candidates: int = None) -> tup
         max_candidates = RAGConfig.MAX_CANDIDATES
 
     candidates = (retrieved_docs or [])[:max_candidates]
-    metadata = {"reason": None, "max_score": None, "filtered_count": 0}
+    metadata = {"reason": None, "max_score": None, "filtered_count": 0, "dedup_count": 0}
 
     if not candidates:
         metadata["reason"] = "no_candidates_retrieved"
@@ -38,15 +38,27 @@ def select_context_docs(retrieved_docs: List, max_candidates: int = None) -> tup
     cutoff = max(max_score * RAGConfig.ALPHA, RAGConfig.SOFT_MIN)
 
     final_docs = []
+    seen_pages = set()
     for i, doc in enumerate(candidates):
         score = get_doc_score(doc) or max_score
-        if i < RAGConfig.MIN_KEEP or score >= cutoff:
-            final_docs.append(doc)
-        else:
+        source = (doc.metadata or {}).get("source", "Unknown")
+        page = (doc.metadata or {}).get("page", 0)
+        page_key = (source, page)
+
+        should_keep = i < RAGConfig.MIN_KEEP or score >= cutoff
+        if not should_keep:
             metadata["filtered_count"] += 1
+            continue
+
+        # Prefer coverage across unique pages to avoid sending duplicates of one page.
+        if page_key in seen_pages:
+            metadata["dedup_count"] += 1
+            continue
+
+        final_docs.append(doc)
+        seen_pages.add(page_key)
         if len(final_docs) >= RAGConfig.FINAL_K:
             break
 
     metadata["reason"] = "success"
     return final_docs, metadata
-
