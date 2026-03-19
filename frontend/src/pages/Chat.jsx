@@ -121,6 +121,7 @@ const stripQualityMetrics = (text) => {
     '📊 response quality metrics',
     'overall quality',
     'answer relevancy',
+    'answer match',
     'faithfulness',
     'context precision',
     'context recall',
@@ -162,10 +163,17 @@ const stripQualityMetrics = (text) => {
   return result.join('\n');
 };
 
-const RAGAS_METRIC_KEYS = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"];
+const RAGAS_METRIC_KEYS = [
+  "faithfulness",
+  "answer_relevancy",
+  "answer_match",
+  "context_precision",
+  "context_recall",
+];
 const RAGAS_METRIC_LABELS = {
   faithfulness: "Faithfulness",
   answer_relevancy: "Answer Relevancy",
+  answer_match: "Answer Match",
   context_precision: "Context Precision",
   context_recall: "Context Recall",
 };
@@ -177,6 +185,19 @@ const formatRagasMetric = (value) => {
   return `${(num * 100).toFixed(1)}%`;
 };
 
+const formatSeconds = (value) => {
+  if (value === null || value === undefined) return "N/A";
+  const num = Number(value);
+  if (Number.isNaN(num)) return "N/A";
+  return `${num.toFixed(num >= 10 ? 1 : 2)}s`;
+};
+
+const toPositivePageNumber = (value) => {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return Math.round(num);
+};
+
 const formatResponseMode = (mode) => {
   const value = String(mode || "").toLowerCase();
   if (value === "vision") return "Vision";
@@ -184,10 +205,233 @@ const formatResponseMode = (mode) => {
   return null;
 };
 
+const formatIntentLabel = (value) => {
+  if (!value) return null;
+  return String(value)
+    .split("_")
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+};
+
+const formatIntentSourceLabel = (value) => {
+  const normalized = String(value || "").toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "intent_llm_structured") return "Parsed Scope";
+  if (normalized.startsWith("fallback")) return "Fallback Scope";
+  return formatIntentLabel(value) || value;
+};
+
+const formatModelLabel = (value) => {
+  if (!value) return null;
+  return String(value)
+    .replace(/\s+User'?s Manual\s*\(Hardware\)\s*$/i, "")
+    .replace(/\s+Manual\s*\(Hardware\)\s*$/i, "")
+    .trim();
+};
+
+const getIntentSummaryRows = (message) => {
+  const details = message?.intentDetails || {};
+  const rows = [];
+
+  const brand = details.matched_brand || details.brand;
+  const model = formatModelLabel(details.matched_model_subbrand || details.model_input);
+  const intent = formatIntentLabel(details.intent);
+  const topic = details.topic || "";
+  const query = message?.intentQuery || details.normalized_query || "";
+  const status = details.status || "";
+
+  if (brand) rows.push({ label: "Brand", value: brand });
+  if (model) rows.push({ label: "Model", value: model });
+  if (intent) rows.push({ label: "Intent", value: intent });
+  if (topic) rows.push({ label: "Topic", value: topic });
+  if (query) rows.push({ label: "Search Query", value: query });
+  if (status && status !== "ok") {
+    rows.push({ label: "Status", value: formatIntentLabel(status) || status });
+  }
+
+  return rows;
+};
+
+const getScopeChipRows = (message) => {
+  const rows = getIntentSummaryRows(message);
+  return rows.filter((row) => ["Brand", "Model", "Intent"].includes(row.label));
+};
+
+const getIntentDetailRows = (message) => {
+  const rows = getIntentSummaryRows(message);
+  return rows.filter((row) => !["Brand", "Model", "Intent"].includes(row.label));
+};
+
 const shouldShowVisionFallback = (message) => {
   const requested = String(message?.requestedMode || "").toLowerCase();
   const response = String(message?.responseMode || "").toLowerCase();
   return requested === "vision" && response !== "vision" && Boolean(message?.modeFallbackReason);
+};
+
+const getSelectedSourceGroups = (message) => {
+  const details = Array.isArray(message?.sourceDetails) ? message.sourceDetails : [];
+  const groups = new Map();
+
+  for (const item of details) {
+    if (!item) continue;
+
+    const source = item.source || item.source_id || "Unknown document";
+    const sourceId = item.source_id || source;
+    const key = `${sourceId}::${item.brand || ""}::${item.model_subbrand || ""}`;
+    const page = toPositivePageNumber(item.page);
+    const score = Number(item.score);
+    const existing = groups.get(key) || {
+      key,
+      source,
+      sourceId,
+      pages: [],
+      pageSet: new Set(),
+      score: Number.isFinite(score) ? score : null,
+    };
+
+    if (page !== null && !existing.pageSet.has(page)) {
+      existing.pageSet.add(page);
+      existing.pages.push(page);
+    }
+
+    if (Number.isFinite(score) && (existing.score === null || score > existing.score)) {
+      existing.score = score;
+    }
+
+    groups.set(key, existing);
+  }
+
+  if (!groups.size) {
+    const sources = Array.isArray(message?.sources) ? message.sources : [];
+    return [...new Set(sources.filter(Boolean))].map((source) => ({
+      key: source,
+      source,
+      sourceId: source,
+      pages: [],
+      score: null,
+    }));
+  }
+
+  return [...groups.values()]
+    .map((group) => ({
+      key: group.key,
+      source: group.source,
+      sourceId: group.sourceId,
+      pages: [...group.pages].sort((a, b) => a - b),
+      score: group.score,
+    }))
+    .sort((a, b) => {
+      if (a.score !== null && b.score !== null && a.score !== b.score) {
+        return b.score - a.score;
+      }
+      if (a.score !== null) return -1;
+      if (b.score !== null) return 1;
+      return a.source.localeCompare(b.source);
+    });
+};
+
+const mapServerMessage = (message) => ({
+  text: message.content,
+  sender: message.role === "user" ? "user" : "bot",
+  timestamp: message.created_at,
+  processingTime: message.metadata?.processing_time,
+  retrievalTime: message.metadata?.retrieval_time,
+  llmTime: message.metadata?.llm_time,
+  contextCount: message.metadata?.context_count ?? null,
+  sources: message.metadata?.sources || [],
+  sourceDetails: Array.isArray(message.metadata?.source_details) ? message.metadata.source_details : [],
+  ragas: message.metadata?.ragas || null,
+  ragasStatus: message.metadata?.ragas_status || null,
+  responseMode: message.metadata?.response_mode || null,
+  requestedMode: message.metadata?.requested_mode || null,
+  modeFallbackReason: message.metadata?.mode_fallback_reason || null,
+  answerSupportStatus: message.metadata?.answer_support_status || null,
+  intentQuery: message.metadata?.intent_query || null,
+  intentSource: message.metadata?.intent_source || null,
+  intentDetails: message.metadata?.intent_details || null,
+});
+
+const formatModeFallbackReason = (reason) => {
+  const value = String(reason || "").toLowerCase();
+  if (value === "no_selected_docs") return "No relevant pages were selected.";
+  if (value === "no_page_images") return "Page images could not be loaded.";
+  if (value === "vision_not_found") return "The vision model could not answer from the pages.";
+  if (value === "vision_prepare_error") return "The page-image context could not be prepared.";
+  if (value === "vision_invoke_error") return "The vision model request failed.";
+  return value ? `Fallback reason: ${value}` : "";
+};
+
+const getModeSummary = (message) => {
+  if (String(message?.answerSupportStatus || "").toLowerCase() !== "supported") {
+    return null;
+  }
+
+  const requested = String(message?.requestedMode || "").toLowerCase();
+  const response = String(message?.responseMode || "").toLowerCase();
+
+  if (requested === "vision" && response === "vision") {
+    return {
+      label: "Used page images",
+      tone: "vision",
+    };
+  }
+
+  if (requested === "vision" && response !== "vision") {
+    return {
+      label: "Vision fallback",
+      tone: "fallback",
+    };
+  }
+
+  if (response === "text") {
+    return {
+      label: "Used text context",
+      tone: "text",
+    };
+  }
+
+  return null;
+};
+
+const getModeChipClassName = (tone) => {
+  if (tone === "vision") return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  if (tone === "fallback") return "border-amber-200 bg-amber-50 text-amber-700";
+  return "border-slate-200 bg-slate-50 text-slate-600";
+};
+
+const shouldShowDetails = (message) => {
+  return Boolean(
+    getIntentDetailRows(message).length ||
+    (message?.ragasStatus && message.ragasStatus !== "disabled") ||
+    message?.intentSource ||
+    shouldShowVisionFallback(message) ||
+    getSelectedSourceGroups(message).length ||
+    (message?.llmTime !== null && message?.llmTime !== undefined) ||
+    (message?.processingTime !== null && message?.processingTime !== undefined)
+  );
+};
+
+const getLegacyQualitySummary = (message) => {
+  if (!message?.ragasStatus || message.ragasStatus === "disabled") return null;
+  if (message.ragasStatus === "pending") return "Evaluating answer quality...";
+  if (message.ragasStatus === "error") return "Quality evaluation could not be completed.";
+  const faithfulness = formatRagasMetric(message.ragas?.faithfulness);
+  const relevancy = formatRagasMetric(message.ragas?.answer_relevancy);
+  return `Faithfulness ${faithfulness} • Answer relevancy ${relevancy}`;
+};
+
+void getLegacyQualitySummary;
+
+const getQualitySummary = (message) => {
+  if (!message?.ragasStatus || message.ragasStatus === "disabled") return null;
+  if (message.ragasStatus === "pending") return "Evaluating answer quality...";
+  if (message.ragasStatus === "error") return "Quality evaluation could not be completed.";
+
+  const faithfulness = formatRagasMetric(message.ragas?.faithfulness);
+  const relevancy = formatRagasMetric(message.ragas?.answer_relevancy);
+  const answerMatch = formatRagasMetric(message.ragas?.answer_match);
+  return `Faithfulness ${faithfulness} | Answer relevancy ${relevancy} | Answer match ${answerMatch}`;
 };
 
 
@@ -308,17 +552,7 @@ function Chat({ onLogout }) {
 
     api.get(`/api/chat/sessions/${activeChatId}`)
       .then(res => {
-        const messages = res.data.items.map(m => ({
-          text: m.content,
-          sender: m.role === "user" ? "user" : "bot",
-          timestamp: m.created_at,
-          processingTime: m.metadata?.processing_time,
-          ragas: m.metadata?.ragas || null,
-          ragasStatus: m.metadata?.ragas_status || null,
-          responseMode: m.metadata?.response_mode || null,
-          requestedMode: m.metadata?.requested_mode || null,
-          modeFallbackReason: m.metadata?.mode_fallback_reason || null,
-        }));
+        const messages = res.data.items.map(mapServerMessage);
 
         setChatHistory(prev =>
           prev.map(c =>
@@ -352,17 +586,7 @@ function Chat({ onLogout }) {
     setLoadingMore(true);
     try {
       const res = await api.get(`/api/chat/sessions/${activeChatId}?offset=${pagination.offset}`);
-      const olderMessages = res.data.items.map(m => ({
-        text: m.content,
-        sender: m.role === "user" ? "user" : "bot",
-        timestamp: m.created_at,
-        processingTime: m.metadata?.processing_time,
-        ragas: m.metadata?.ragas || null,
-        ragasStatus: m.metadata?.ragas_status || null,
-        responseMode: m.metadata?.response_mode || null,
-        requestedMode: m.metadata?.requested_mode || null,
-        modeFallbackReason: m.metadata?.mode_fallback_reason || null,
-      }));
+      const olderMessages = res.data.items.map(mapServerMessage);
 
       setChatHistory(prev =>
         prev.map(c =>
@@ -386,6 +610,31 @@ function Chat({ onLogout }) {
       setLoadingMore(false);
     }
   };
+
+  useEffect(() => {
+    if (!activeChatId) return;
+
+    const activeChat = chatHistory.find(c => c.id === activeChatId);
+    const hasPendingRagas = Boolean(
+      activeChat?.messages?.some(m => m.sender === "bot" && m.ragasStatus === "pending")
+    );
+    if (!hasPendingRagas) return;
+
+    const intervalId = window.setInterval(() => {
+      api.get(`/api/chat/sessions/${activeChatId}`)
+        .then(res => {
+          const messages = res.data.items.map(mapServerMessage);
+          setChatHistory(prev =>
+            prev.map(c =>
+              c.id === activeChatId ? { ...c, messages } : c
+            )
+          );
+        })
+        .catch(err => console.error("Failed to refresh pending RAGAS:", err));
+    }, 5000);
+
+    return () => window.clearInterval(intervalId);
+  }, [activeChatId, chatHistory]);
 
   /* ================= HANDLERS ================= */
 
@@ -494,6 +743,13 @@ function Chat({ onLogout }) {
         sender: "bot",
         timestamp: new Date().toISOString(),
         isStreaming: true,
+        processingTime: null,
+        retrievalTime: null,
+        llmTime: null,
+        contextCount: null,
+        sources: [],
+        sourceDetails: [],
+        answerSupportStatus: null,
         responseMode: useVisionMode ? "vision" : "text",
         requestedMode: useVisionMode ? "vision" : "text",
         modeFallbackReason: null,
@@ -560,7 +816,21 @@ function Chat({ onLogout }) {
                 return c;
               }));
             } else if (event.type === "context") {
-              // Context event - could show sources in future if needed
+              setChatHistory(prev => prev.map(c => {
+                if (c.id !== createdSessionId) return c;
+
+                const msgs = [...c.messages];
+                const last = msgs[msgs.length - 1];
+                if (!last || last.sender !== "bot") return c;
+
+                msgs[msgs.length - 1] = {
+                  ...last,
+                  contextCount: event.doc_count ?? last.contextCount ?? null,
+                  sources: Array.isArray(event.sources) ? event.sources : last.sources || [],
+                  sourceDetails: Array.isArray(event.page_references) ? event.page_references : last.sourceDetails || [],
+                };
+                return { ...c, messages: msgs };
+              }));
             } else if (event.type === "stats") {
               const stats = event.data;
               setChatHistory(prev => prev.map(c => {
@@ -571,11 +841,20 @@ function Chat({ onLogout }) {
                   msgs[msgs.length - 1] = {
                     ...last,
                     processingTime: stats.processing_time,
+                    retrievalTime: stats.retrieval_time,
+                    llmTime: stats.llm_time,
+                    contextCount: stats.context_count ?? null,
+                    sources: Array.isArray(stats.sources) ? stats.sources : last.sources || [],
+                    sourceDetails: Array.isArray(stats.source_details) ? stats.source_details : last.sourceDetails || [],
                     ragas: stats.ragas || null,
                     ragasStatus: stats.ragas_status || null,
                     responseMode: stats.response_mode || last.responseMode || null,
                     requestedMode: stats.requested_mode || last.requestedMode || null,
                     modeFallbackReason: stats.mode_fallback_reason || null,
+                    answerSupportStatus: stats.answer_support_status || null,
+                    intentQuery: stats.intent_query || null,
+                    intentSource: stats.intent_source || null,
+                    intentDetails: stats.intent_details || null,
                     // Ensure text is final and is a string
                     text: typeof finalText === 'string' ? finalText : String(finalText || ''),
                     isStreaming: false
@@ -1040,7 +1319,11 @@ function Chat({ onLogout }) {
                         ) : m.isStreaming && !m.text ? (
                           <div className="flex items-center gap-3 text-gray-500 text-sm">
                             <LoaderCircle size={18} className="animate-spin text-blue-500" />
-                            <span className="font-medium">Thinking...</span>
+                            <span className="font-medium">
+                              {String(m.requestedMode || "").toLowerCase() === "vision"
+                                ? "Reading selected manual pages..."
+                                : "Thinking..."}
+                            </span>
                           </div>
                         ) :
                           <ReactMarkdown
@@ -1126,32 +1409,160 @@ function Chat({ onLogout }) {
                     </div>
 
                     {m.sender === "bot" && (
-                      <div className="mt-1 max-w-[85%] rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
-                        <div className="mb-1 flex items-center justify-between gap-2">
-                          <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">
-                            RAGAS Metrics
-                            {m.ragasStatus === "pending" ? " (Pending)" : ""}
-                          </div>
-                          {formatResponseMode(m.responseMode) && (
-                            <span className="rounded bg-gray-200 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
-                              Mode: {formatResponseMode(m.responseMode)}
-                              {shouldShowVisionFallback(m) ? " (Fallback)" : ""}
+                      <div className="mt-1 flex max-w-[85%] flex-col gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
+                          {getModeSummary(m) && (
+                            <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium ${getModeChipClassName(getModeSummary(m).tone)}`}>
+                              {getModeSummary(m).label}
                             </span>
                           )}
-                        </div>
-                        <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-                          {RAGAS_METRIC_KEYS.map((key) => (
-                            <div
-                              key={key}
-                              className="flex items-center justify-between gap-2 text-[11px] text-gray-700"
+                          {getScopeChipRows(m).map((row) => (
+                            <span
+                              key={`${row.label}-${row.value}`}
+                              className="inline-flex rounded-full border border-blue-100 bg-blue-50 px-2.5 py-1 text-[11px] font-medium text-blue-700"
                             >
-                              <span>{RAGAS_METRIC_LABELS[key]}</span>
-                              <span className="font-semibold text-gray-900">
-                                {formatRagasMetric(m.ragas?.[key])}
-                              </span>
-                            </div>
+                              <span className="mr-1 text-blue-500">{row.label}:</span>
+                              <span className="max-w-[36ch] truncate">{row.value}</span>
+                            </span>
                           ))}
                         </div>
+
+                        {shouldShowDetails(m) && (
+                          <details className="rounded-xl border border-gray-200 bg-white/80 px-3 py-2 text-[12px] text-gray-700">
+                            <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
+                              <span className="font-medium text-gray-700">Details</span>
+                              <span className="text-[11px] text-gray-400">
+                                {getQualitySummary(m) || "Scope, timing, and retrieval info"}
+                              </span>
+                            </summary>
+
+                            <div className="mt-3 flex flex-col gap-3 border-t border-gray-100 pt-3">
+                              {(getIntentDetailRows(m).length > 0 || m.intentSource) && (
+                                <div className="rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-2">
+                                  <div className="mb-2 flex items-center justify-between gap-2">
+                                    <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-700">
+                                      Scope
+                                    </div>
+                                    {formatIntentSourceLabel(m.intentSource) && (
+                                      <span className="rounded bg-blue-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-700">
+                                        {formatIntentSourceLabel(m.intentSource)}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="grid grid-cols-1 gap-y-2">
+                                    {getIntentDetailRows(m).map((row) => (
+                                      <div key={`${row.label}-${row.value}`} className="flex flex-col gap-0.5">
+                                        <span className="text-[10px] font-semibold uppercase tracking-wide text-blue-700">{row.label}</span>
+                                        <span className="break-words text-[12px] text-blue-950">{row.value}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {((m.llmTime !== null && m.llmTime !== undefined) || (m.processingTime !== null && m.processingTime !== undefined) || m.contextCount !== null) && (
+                                <div className="rounded-lg border border-gray-200 bg-white px-3 py-2">
+                                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                                    Response
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                                    <div className="flex items-center justify-between gap-2 text-[11px] text-gray-700">
+                                      <span>Answer Time</span>
+                                      <span className="font-semibold text-gray-900">
+                                        {formatSeconds(m.llmTime ?? m.processingTime)}
+                                      </span>
+                                    </div>
+                                    <div className="flex items-center justify-between gap-2 text-[11px] text-gray-700">
+                                      <span>Selected Pages</span>
+                                      <span className="font-semibold text-gray-900">
+                                        {getSelectedSourceGroups(m).reduce((count, group) => count + group.pages.length, 0) || (m.contextCount ?? 0)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+
+                              {m.ragasStatus && m.ragasStatus !== "disabled" && (
+                                <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                                  <div className="mb-2 flex items-center justify-between gap-2">
+                                    <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                                      Quality Checks
+                                      {m.ragasStatus === "pending" ? " (Pending)" : ""}
+                                    </div>
+                                    {formatResponseMode(m.responseMode) && (
+                                      <span className="rounded bg-gray-200 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
+                                        {formatResponseMode(m.responseMode)}
+                                        {shouldShowVisionFallback(m) ? " fallback" : ""}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+                                    {RAGAS_METRIC_KEYS.map((key) => (
+                                      <div
+                                        key={key}
+                                        className="flex items-center justify-between gap-2 text-[11px] text-gray-700"
+                                      >
+                                        <span>{RAGAS_METRIC_LABELS[key]}</span>
+                                        <span className="font-semibold text-gray-900">
+                                          {formatRagasMetric(m.ragas?.[key])}
+                                        </span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                  <div className="mt-2 text-[11px] text-gray-500">
+                                    Answer Match compares the reply against the expected answer when ground truth is available. Context Precision and Context Recall also require ground truth.
+                                  </div>
+                                  {shouldShowVisionFallback(m) && (
+                                    <div className="mt-2 rounded-md border border-amber-100 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
+                                      {formatModeFallbackReason(m.modeFallbackReason) || "Vision was requested, but this reply used text context."}
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+
+                              {getSelectedSourceGroups(m).length > 0 && (
+                                <div className="rounded-lg border border-gray-200 bg-white px-3 py-2">
+                                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                                    Selected Documents
+                                  </div>
+                                  <div className="flex flex-col gap-2">
+                                    {getSelectedSourceGroups(m).map((group) => (
+                                      <div
+                                        key={group.key}
+                                        className="rounded-md border border-gray-200 bg-gray-50 px-2.5 py-2"
+                                      >
+                                        <div className="flex items-start justify-between gap-2">
+                                          <div className="break-words text-[11px] font-medium text-gray-900">
+                                            {group.source}
+                                          </div>
+                                          {group.score !== null && (
+                                            <span className="shrink-0 text-[10px] font-medium text-gray-500">
+                                              Score {group.score.toFixed(3)}
+                                            </span>
+                                          )}
+                                        </div>
+                                        <div className="mt-1 flex flex-wrap gap-1.5">
+                                          {group.pages.length > 0 ? (
+                                            group.pages.map((page) => (
+                                              <span
+                                                key={`${group.key}-page-${page}`}
+                                                className="rounded-full border border-gray-200 bg-white px-2 py-0.5 text-[10px] font-medium text-gray-700"
+                                              >
+                                                Page {page}
+                                              </span>
+                                            ))
+                                          ) : (
+                                            <span className="text-[10px] text-gray-500">Page N/A</span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          </details>
+                        )}
                       </div>
                     )}
                     

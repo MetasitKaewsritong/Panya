@@ -15,16 +15,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List
 
 from psycopg2 import pool
 from sentence_transformers import SentenceTransformer
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 from app.chatbot import answer_question
+from app.llm_factory import create_intent_llm, create_main_llm, is_intent_llm_enabled
 from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever
+
+logger = logging.getLogger(__name__)
 
 
 def load_questions(filepath: str) -> List[str]:
@@ -44,9 +47,9 @@ def setup_dependencies():
     if not db_url:
         raise RuntimeError("DATABASE_URL environment variable is required.")
 
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is required.")
+    llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not llm_api_key:
+        raise RuntimeError("LLM_API_KEY (or DASHSCOPE_API_KEY / OPENAI_API_KEY) environment variable is required.")
 
     db_pool = pool.SimpleConnectionPool(
         minconn=int(os.getenv("DB_POOL_MIN", "1")),
@@ -54,19 +57,27 @@ def setup_dependencies():
         dsn=db_url,
     )
 
-    llm = ChatGoogleGenerativeAI(
-        model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
-        google_api_key=gemini_api_key,
+    llm = create_main_llm(
         temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         timeout=int(os.getenv("LLM_TIMEOUT", "30")),
     )
+    intent_llm = None
+    if is_intent_llm_enabled():
+        try:
+            intent_llm = create_intent_llm(
+                temperature=float(os.getenv("INTENT_LLM_TEMPERATURE", "0.0")),
+                timeout=int(os.getenv("INTENT_LLM_TIMEOUT", "15")),
+                max_tokens=int(os.getenv("INTENT_LLM_NUM_PREDICT", "160")),
+            )
+        except Exception as e:
+            logger.warning("Intent LLM unavailable in batch mode; falling back to original query: %s", e)
 
     embedder = SentenceTransformer(
         os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
         cache_folder=os.getenv("MODEL_CACHE", "/app/models"),
     )
 
-    return db_pool, llm, embedder
+    return db_pool, llm, intent_llm, embedder
 
 
 def run_batch_questions(input_file: str, output_file: str, collection: str = "plcnext") -> List[Dict[str, Any]]:
@@ -74,7 +85,7 @@ def run_batch_questions(input_file: str, output_file: str, collection: str = "pl
     if not questions:
         raise RuntimeError(f"No valid questions found in {input_file}")
 
-    db_pool, llm, embedder = setup_dependencies()
+    db_pool, llm, intent_llm, embedder = setup_dependencies()
     results: List[Dict[str, Any]] = []
 
     try:
@@ -85,6 +96,7 @@ def run_batch_questions(input_file: str, output_file: str, collection: str = "pl
                 question=question,
                 db_pool=db_pool,
                 llm=llm,
+                intent_llm=intent_llm,
                 embedder=embedder,
                 collection=collection,
                 retriever_class=PostgresVectorRetriever,

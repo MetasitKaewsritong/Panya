@@ -1,8 +1,13 @@
-import base64
+import json
 import logging
 import re
 import time
 from typing import Any, Dict, List
+import base64
+
+from langchain_core.output_parsers import StrOutputParser
+
+from app.chat.prompts import build_intent_extraction_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -59,45 +64,6 @@ def extract_text_from_llm_response(response) -> str:
     return str(content)
 
 
-def fix_markdown_tables(text: str) -> str:
-    """
-    Fix malformed markdown tables that are on a single line.
-    Converts: | A | B | | --- | --- | | 1 | 2 |
-    To proper multi-line format.
-    """
-    if not text or "|" not in text:
-        return text
-
-    lines = text.split("\n")
-    fixed_lines = []
-
-    for line in lines:
-        if re.search(r"\|\s*-{2,}\s*\|.*\|", line) and line.count("|") > 8:
-            parts = [p.strip() for p in line.split("|")]
-            parts = [p for p in parts if p]
-
-            if len(parts) >= 4:
-                sep_indices = [i for i, p in enumerate(parts) if re.match(r"^-+$", p)]
-
-                if sep_indices and len(sep_indices) >= 1:
-                    num_cols = sep_indices[0]
-
-                    if num_cols > 0 and num_cols == len(sep_indices):
-                        result_rows = []
-                        for i in range(0, len(parts), num_cols):
-                            row_parts = parts[i : i + num_cols]
-                            if len(row_parts) == num_cols:
-                                result_rows.append("| " + " | ".join(row_parts) + " |")
-
-                        if result_rows:
-                            fixed_lines.append("\n".join(result_rows))
-                            continue
-
-        fixed_lines.append(line)
-
-    return "\n".join(fixed_lines)
-
-
 def is_not_found_response(text: str) -> bool:
     """Detect the canonical fallback response."""
     if not text:
@@ -132,16 +98,91 @@ def preprocess_query(query: str) -> str:
     return processed if processed != query.lower() else query
 
 
-def encode_images_for_gemini(page_images: List[Dict[str, Any]]) -> List[str]:
+def _clean_intent_query(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            for key in ("normalized_query", "retrieval_query", "query", "intent", "search_query"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw = value.strip()
+                    break
+    except Exception:
+        pass
+
+    lines = [line.strip(" -*\t") for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    candidate = lines[0]
+    candidate = re.sub(r"^(retrieval query|search query|query|intent)\s*:\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = candidate.strip().strip("`").strip('"').strip("'").strip()
+    candidate = re.sub(r"\s+", " ", candidate)
+    return candidate
+
+
+def build_retrieval_query(
+    question: str,
+    *,
+    intent_llm=None,
+    history_section: str = "",
+) -> tuple[str, str]:
     """
-    Encode page images as base64 for Gemini vision API.
+    Produce the retrieval query used before reranking.
+
+    Returns:
+        (query, source) where source indicates whether the query came from the
+        intent model or from the fallback preprocessing path.
     """
-    encoded_images = []
+    processed_question = preprocess_query((question or "").strip())
+    if not processed_question:
+        return "", "empty_question"
+
+    if intent_llm is None:
+        return processed_question, "fallback_no_intent_llm"
+
+    try:
+        chain = build_intent_extraction_prompt() | intent_llm | StrOutputParser()
+        rewritten = call_llm_with_retry(
+            lambda: chain.invoke(
+                {
+                    "history_section": history_section,
+                    "question": question,
+                }
+            ),
+            max_retries=2,
+            base_wait=0.5,
+        )
+        cleaned = _clean_intent_query(rewritten)
+        if not cleaned:
+            return processed_question, "fallback_empty_intent_query"
+        return preprocess_query(cleaned), "intent_llm"
+    except Exception as e:
+        logger.warning("[INTENT_LLM] Failed to extract intent, using original query: %s", e)
+        return processed_question, "fallback_intent_error"
+
+
+def build_openai_compatible_image_parts(page_images: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build OpenAI-compatible image parts for multimodal chat models.
+    """
+    content_parts: List[Dict[str, Any]] = []
     for page in page_images:
         image_bytes = page["image_data"]
         base64_image = base64.b64encode(image_bytes).decode("utf-8")
-        encoded_images.append(base64_image)
-    return encoded_images
+        content_parts.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{base64_image}",
+                },
+            }
+        )
+    return content_parts
 
 
 def format_chat_history(chat_history: List[dict], max_messages: int = 6) -> str:

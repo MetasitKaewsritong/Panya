@@ -2,24 +2,27 @@
 Optional offline RAGAS evaluator for ground-truth checks.
 
 This script is intentionally separate from runtime chat.
-It evaluates context_precision/context_recall using Gemini as judge LLM.
+It evaluates context_precision/context_recall using the configured judge LLM.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from typing import Dict, Any, List
 
 from psycopg2 import pool
 from sentence_transformers import SentenceTransformer
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 from app.chatbot import answer_question
 from app.chat.selection import select_context_docs
-from app.chat.text_utils import preprocess_query
+from app.llm_factory import create_intent_llm, create_main_llm, is_intent_llm_enabled
+from app.chat.text_utils import build_retrieval_query
 from app.retriever import PostgresVectorRetriever, EnhancedFlashrankRerankRetriever
+
+logger = logging.getLogger(__name__)
 
 
 def _setup_runtime():
@@ -27,9 +30,9 @@ def _setup_runtime():
     if not db_url:
         raise RuntimeError("DATABASE_URL environment variable is required.")
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is required.")
+        raise RuntimeError("LLM_API_KEY (or DASHSCOPE_API_KEY / OPENAI_API_KEY) environment variable is required.")
 
     db_pool = pool.SimpleConnectionPool(
         minconn=int(os.getenv("DB_POOL_MIN", "1")),
@@ -37,28 +40,37 @@ def _setup_runtime():
         dsn=db_url,
     )
 
-    llm = ChatGoogleGenerativeAI(
-        model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
-        google_api_key=api_key,
+    llm = create_main_llm(
         temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         timeout=int(os.getenv("LLM_TIMEOUT", "30")),
     )
+    intent_llm = None
+    if is_intent_llm_enabled():
+        try:
+            intent_llm = create_intent_llm(
+                temperature=float(os.getenv("INTENT_LLM_TEMPERATURE", "0.0")),
+                timeout=int(os.getenv("INTENT_LLM_TIMEOUT", "15")),
+                max_tokens=int(os.getenv("INTENT_LLM_NUM_PREDICT", "160")),
+            )
+        except Exception as e:
+            logger.warning("Intent LLM unavailable in RAGAS ground-truth eval; falling back to original query: %s", e)
 
     embedder = SentenceTransformer(
         os.getenv("EMBED_MODEL", "BAAI/bge-m3"),
         cache_folder=os.getenv("MODEL_CACHE", "/app/models"),
     )
-    return db_pool, llm, embedder
+    return db_pool, llm, intent_llm, embedder
 
 
-def _get_selected_contexts(question: str, db_pool, embedder, collection: str) -> List[str]:
+def _get_selected_contexts(question: str, db_pool, intent_llm, embedder, collection: str) -> List[str]:
     base = PostgresVectorRetriever(
         connection_pool=db_pool,
         embedder=embedder,
         collection=collection,
     )
     reranker = EnhancedFlashrankRerankRetriever(base_retriever=base)
-    docs = reranker.invoke(preprocess_query(question)) or []
+    retrieval_query, _intent_source = build_retrieval_query(question, intent_llm=intent_llm)
+    docs = reranker.invoke(retrieval_query) or []
     selected, _ = select_context_docs(docs)
     return [d.page_content for d in selected]
 
@@ -79,19 +91,20 @@ def evaluate_two_metrics(
             "pip install -r backend/requirements-ragas.txt"
         ) from e
 
-    db_pool, llm, embedder = _setup_runtime()
+    db_pool, llm, intent_llm, embedder = _setup_runtime()
     try:
         chat_result = answer_question(
             question=question,
             db_pool=db_pool,
             llm=llm,
+            intent_llm=intent_llm,
             embedder=embedder,
             collection=collection,
             retriever_class=PostgresVectorRetriever,
             reranker_class=EnhancedFlashrankRerankRetriever,
         )
         answer = chat_result.get("reply", "")
-        contexts = _get_selected_contexts(question, db_pool, embedder, collection)
+        contexts = _get_selected_contexts(question, db_pool, intent_llm, embedder, collection)
 
         ragas_embeddings = HuggingFaceEmbeddings(
             model_name=os.getenv("RAGAS_EMBED_MODEL_EVAL", "sentence-transformers/all-MiniLM-L6-v2"),
@@ -132,7 +145,7 @@ def evaluate_two_metrics(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Evaluate context_precision/context_recall with Gemini + ground truth.")
+    parser = argparse.ArgumentParser(description="Evaluate context_precision/context_recall with the configured chat LLM + ground truth.")
     parser.add_argument("--question", required=True, help="Question to evaluate")
     parser.add_argument("--ground-truth", required=True, help="Reference answer for recall/precision evaluation")
     parser.add_argument("--collection", default=os.getenv("DEFAULT_COLLECTION", "plcnext"), help="Vector collection name")

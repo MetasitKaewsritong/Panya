@@ -2,6 +2,13 @@ from typing import List, Dict, Optional, Any
 import json
 
 
+def _rollback_quietly(conn) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 # =========================
 # Chat Session
 # =========================
@@ -21,6 +28,9 @@ def create_chat_session(db_pool, user_id: int, title: Optional[str] = None) -> i
             session_id = cur.fetchone()[0]
             conn.commit()
             return session_id
+    except Exception:
+        _rollback_quietly(conn)
+        raise
     finally:
         db_pool.putconn(conn)
 
@@ -76,6 +86,9 @@ def update_chat_session_title(
             )
             conn.commit()
             return cur.rowcount > 0
+    except Exception:
+        _rollback_quietly(conn)
+        raise
     finally:
         db_pool.putconn(conn)
 
@@ -91,16 +104,6 @@ def delete_chat_session(
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
-            # Delete messages first (in case ON DELETE CASCADE is not set)
-            cur.execute(
-                """
-                DELETE FROM chat_messages
-                WHERE session_id = %s
-                """,
-                (session_id,),
-            )
-
-            # Delete session
             cur.execute(
                 """
                 DELETE FROM chat_sessions
@@ -111,6 +114,9 @@ def delete_chat_session(
 
             conn.commit()
             return cur.rowcount > 0
+    except Exception:
+        _rollback_quietly(conn)
+        raise
     finally:
         db_pool.putconn(conn)
 
@@ -137,9 +143,11 @@ def insert_chat_message(
                 """
                 INSERT INTO chat_messages (session_id, role, content, metadata)
                 VALUES (%s, %s, %s, %s)
+                RETURNING id
                 """,
                 (session_id, role, content, json.dumps(metadata or {})),
             )
+            message_id = cur.fetchone()[0]
 
             # update session updated_at
             cur.execute(
@@ -152,6 +160,59 @@ def insert_chat_message(
             )
 
             conn.commit()
+            return message_id
+    except Exception:
+        _rollback_quietly(conn)
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+
+def update_chat_message_metadata(
+    db_pool,
+    message_id: int,
+    metadata_patch: Dict[str, Any],
+) -> bool:
+    conn = db_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT session_id, metadata
+                FROM chat_messages
+                WHERE id = %s
+                """,
+                (message_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+
+            session_id, current_metadata = row
+            merged_metadata = dict(current_metadata or {})
+            merged_metadata.update(metadata_patch or {})
+
+            cur.execute(
+                """
+                UPDATE chat_messages
+                SET metadata = %s
+                WHERE id = %s
+                """,
+                (json.dumps(merged_metadata), message_id),
+            )
+            cur.execute(
+                """
+                UPDATE chat_sessions
+                SET updated_at = NOW()
+                WHERE id = %s
+                """,
+                (session_id,),
+            )
+            conn.commit()
+            return True
+    except Exception:
+        _rollback_quietly(conn)
+        raise
     finally:
         db_pool.putconn(conn)
 

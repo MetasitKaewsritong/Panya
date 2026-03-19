@@ -7,7 +7,7 @@ WORKDIR /app
 # คัดลอกแค่ package.json และ package-lock.json (ถ้ามี) ก่อน
 # เพื่อใช้ประโยชน์จาก Docker Cache
 COPY package.json ./
-# COPY package-lock.json ./
+COPY package-lock.json ./
 
 # ติดตั้ง Dependencies ทั้งหมดภายใน Container
 # ขั้นตอนนี้จะสร้าง node_modules ที่ถูกต้องสำหรับ Linux

@@ -18,8 +18,16 @@ def log_chat_request(
     Log concise, production-friendly request telemetry.
     Detailed chunk logs stay at DEBUG level to reduce noise.
     """
+    selected_refs = []
+    for doc in selected_docs or []:
+        metadata = getattr(doc, "metadata", {}) or {}
+        source = metadata.get("source", "unknown")
+        page = metadata.get("page", "N/A")
+        chunk_id = metadata.get("chunk_id", "N/A")
+        selected_refs.append(f"{source}:page={page}:chunk={chunk_id}")
+
     logger.info(
-        "[RAG] q='%s' retrieved=%d selected=%d max_score=%s timings(retrieval=%.3fs rerank=%.3fs llm=%.3fs total=%.3fs)",
+        "[RAG] q='%s' retrieved=%d selected=%d max_score=%s timings(retrieval=%.3fs rerank=%.3fs llm=%.3fs total=%.3fs) selected_refs=%s",
         (question or "")[:100],
         len(retrieved_docs or []),
         len(selected_docs or []),
@@ -28,6 +36,7 @@ def log_chat_request(
         rerank_time,
         llm_time,
         total_time,
+        selected_refs if selected_refs else ["none"],
     )
     for i, doc in enumerate((selected_docs or [])[:3], start=1):
         logger.debug(

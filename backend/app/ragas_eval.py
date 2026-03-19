@@ -5,6 +5,7 @@ Provides optional runtime quality assessment for RAG responses.
 
 from __future__ import annotations
 
+from collections import Counter
 import logging
 import os
 import threading
@@ -34,18 +35,37 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _first_non_empty(*values: Optional[str]) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
 # Primary toggle (keeps backward compatibility with older env flag).
 ENABLE_RAGAS = _env_bool("EVAL_WITH_RAGAS", _env_bool("ENABLE_RAGAS_LLM", False))
 ENABLE_BACKGROUND_RAGAS = _env_bool("ENABLE_BACKGROUND_RAGAS", True)
 
-RAGAS_LLM_PROVIDER = os.getenv("RAGAS_LLM_PROVIDER", "gemini")
-RAGAS_LLM_MODEL = os.getenv("RAGAS_LLM_MODEL", os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+RAGAS_LLM_PROVIDER = os.getenv("RAGAS_LLM_PROVIDER", "openai")
+RAGAS_LLM_MODEL = os.getenv(
+    "RAGAS_LLM_MODEL",
+    os.getenv("LLM_MODEL", "hf.co/Qwen/Qwen3-VL-4B-Thinking-GGUF:Q4_K_M"),
+)
 RAGAS_TIMEOUT = int(os.getenv("RAGAS_TIMEOUT", "30"))
 RAGAS_MAX_WORKERS = max(1, _env_int("RAGAS_MAX_WORKERS", 1))
 # Reusing a single chat client across async evaluation loops can trigger
 # "attached to a different loop" runtime errors in some provider stacks.
 RAGAS_REUSE_LLM = _env_bool("RAGAS_REUSE_LLM", False)
-RAGAS_METRIC_KEYS = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+RAGAS_METRIC_KEYS = [
+    "faithfulness",
+    "answer_relevancy",
+    "answer_match",
+    "context_precision",
+    "context_recall",
+]
 
 _ragas_llm = None
 _ragas_embeddings = None
@@ -59,6 +79,33 @@ _MANUAL_SCOPE_PREFIX_RE = re.compile(
     r"^\s*(?:for|in|from)\s+[^:]{0,180}\bmanual\b\s*:\s*",
     re.IGNORECASE,
 )
+_MATCH_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_MATCH_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_ANSWER_MATCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "to",
+    "was",
+    "were",
+    "with",
+}
 
 
 def _strip_manual_scope_prefix(text: str) -> str:
@@ -77,12 +124,79 @@ def _normalize_question(text: str) -> str:
     return text
 
 
+def _normalize_match_text(text: str) -> str:
+    value = (text or "").strip().lower()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _match_tokens(text: str) -> List[str]:
+    normalized = _normalize_match_text(text)
+    return [
+        token
+        for token in _MATCH_TOKEN_RE.findall(normalized)
+        if token and token not in _ANSWER_MATCH_STOPWORDS
+    ]
+
+
+def _token_f1(answer_tokens: List[str], ground_truth_tokens: List[str]) -> tuple[float, float]:
+    if not answer_tokens or not ground_truth_tokens:
+        return 0.0, 0.0
+
+    common = sum((Counter(answer_tokens) & Counter(ground_truth_tokens)).values())
+    if common <= 0:
+        return 0.0, 0.0
+
+    precision = common / len(answer_tokens)
+    recall = common / len(ground_truth_tokens)
+    if precision + recall == 0:
+        return 0.0, recall
+    return (2 * precision * recall) / (precision + recall), recall
+
+
+def _ground_truth_number_coverage(answer_text: str, ground_truth_text: str) -> Optional[float]:
+    answer_numbers = set(_MATCH_NUMBER_RE.findall(_normalize_match_text(answer_text)))
+    ground_truth_numbers = set(_MATCH_NUMBER_RE.findall(_normalize_match_text(ground_truth_text)))
+    if not ground_truth_numbers:
+        return None
+    return len(answer_numbers.intersection(ground_truth_numbers)) / len(ground_truth_numbers)
+
+
+def calculate_answer_match(answer: str, ground_truth: Optional[str]) -> Optional[float]:
+    if not ground_truth:
+        return None
+
+    answer_norm = _normalize_match_text(answer)
+    ground_truth_norm = _normalize_match_text(ground_truth)
+    if not answer_norm or not ground_truth_norm:
+        return None
+    if answer_norm == ground_truth_norm:
+        return 1.0
+
+    answer_tokens = _match_tokens(answer)
+    ground_truth_tokens = _match_tokens(ground_truth)
+    token_f1, token_recall = _token_f1(answer_tokens, ground_truth_tokens)
+    sequence_ratio = difflib.SequenceMatcher(None, answer_norm, ground_truth_norm).ratio()
+
+    lexical_score = max((0.55 * token_f1) + (0.45 * token_recall), sequence_ratio * 0.9)
+    if ground_truth_norm in answer_norm:
+        lexical_score = max(lexical_score, 0.97)
+    elif answer_norm in ground_truth_norm:
+        lexical_score = max(lexical_score, 0.92)
+
+    numeric_coverage = _ground_truth_number_coverage(answer, ground_truth)
+    if numeric_coverage is not None:
+        lexical_score = (0.75 * lexical_score) + (0.25 * numeric_coverage)
+
+    return round(min(max(lexical_score, 0.0), 1.0), 4)
+
+
 def _ground_truth_paths() -> List[str]:
     raw = os.getenv("RAGAS_GROUND_TRUTH_FILE", "").strip()
     if raw:
         return [p.strip() for p in raw.split(",") if p.strip()]
-    # Default to the file you just created for this project.
-    return ["/app/data/Knowledge/golden_qa_fx485adp_ragas.json"]
+    return []
 
 
 def _load_ground_truth() -> None:
@@ -274,12 +388,26 @@ def _get_ragas_llm():
     if RAGAS_REUSE_LLM and _ragas_llm is not None:
         return _ragas_llm
 
-    if RAGAS_LLM_PROVIDER == "gemini":
-        from langchain_google_genai import ChatGoogleGenerativeAI
+    if RAGAS_LLM_PROVIDER == "openai":
+        from langchain_openai import ChatOpenAI
 
-        llm = ChatGoogleGenerativeAI(
+        llm = ChatOpenAI(
             model=RAGAS_LLM_MODEL,
-            google_api_key=os.getenv("GEMINI_API_KEY"),
+            api_key=_first_non_empty(
+                os.getenv("RAGAS_OPENAI_API_KEY"),
+                os.getenv("LLM_API_KEY"),
+                os.getenv("OLLAMA_API_KEY"),
+                os.getenv("DASHSCOPE_API_KEY"),
+                os.getenv("OPENAI_API_KEY"),
+                "ollama",
+            ),
+            base_url=_first_non_empty(
+                os.getenv("RAGAS_OPENAI_BASE_URL"),
+                os.getenv("LLM_BASE_URL"),
+                os.getenv("OLLAMA_BASE_URL"),
+                os.getenv("OPENAI_BASE_URL"),
+                "http://host.docker.internal:11434/v1",
+            ),
             temperature=float(os.getenv("RAGAS_LLM_TEMPERATURE", "0.0")),
             timeout=RAGAS_TIMEOUT,
         )
@@ -287,12 +415,12 @@ def _get_ragas_llm():
             _ragas_llm = llm
         return llm
 
-    if RAGAS_LLM_PROVIDER == "openai":
-        from langchain_openai import ChatOpenAI
+    if RAGAS_LLM_PROVIDER == "gemini":
+        from langchain_google_genai import ChatGoogleGenerativeAI
 
-        llm = ChatOpenAI(
+        llm = ChatGoogleGenerativeAI(
             model=RAGAS_LLM_MODEL,
-            api_key=os.getenv("OPENAI_API_KEY"),
+            google_api_key=os.getenv("GEMINI_API_KEY"),
             temperature=float(os.getenv("RAGAS_LLM_TEMPERATURE", "0.0")),
             timeout=RAGAS_TIMEOUT,
         )
@@ -326,13 +454,19 @@ def evaluate_response(
     """
     Evaluate RAG response quality using RAGAS metrics.
     """
+    resolved_ground_truth = ground_truth
+    ground_truth_source = "provided_argument" if ground_truth else "none"
+    if not resolved_ground_truth:
+        resolved_ground_truth, ground_truth_source = resolve_ground_truth_with_source(question)
+    answer_match = calculate_answer_match(answer, resolved_ground_truth)
+
     if not ENABLE_RAGAS:
         logger.debug("[RAGAS] Evaluation disabled")
-        return empty_ragas_scores()
+        return _ordered_metric_snapshot({"answer_match": answer_match})
 
     if not contexts or not answer:
         logger.warning("[RAGAS] Missing contexts or answer, skipping evaluation")
-        return empty_ragas_scores()
+        return _ordered_metric_snapshot({"answer_match": answer_match})
 
     try:
         from datasets import Dataset
@@ -343,14 +477,9 @@ def evaluate_response(
             "[RAGAS] Dependencies unavailable: %s. Install optional deps: pip install -r requirements-ragas.txt",
             e,
         )
-        return empty_ragas_scores()
+        return _ordered_metric_snapshot({"answer_match": answer_match})
 
     try:
-        resolved_ground_truth = ground_truth
-        ground_truth_source = "provided_argument" if ground_truth else "none"
-        if not resolved_ground_truth:
-            resolved_ground_truth, ground_truth_source = resolve_ground_truth_with_source(question)
-
         data = {
             "question": [question],
             "answer": [answer],
@@ -404,12 +533,13 @@ def evaluate_response(
         result = evaluate(**evaluate_kwargs)
 
         scores = _extract_scores(result, metric_names)
+        scores["answer_match"] = answer_match
         metric_snapshot = _ordered_metric_snapshot(scores)
         logger.info("[RAGAS] Evaluation complete\n%s", format_scores(metric_snapshot))
         return metric_snapshot
     except Exception as e:
         logger.error("[RAGAS] Evaluation failed: %s", e, exc_info=True)
-        return empty_ragas_scores()
+        return _ordered_metric_snapshot({"answer_match": answer_match})
 
 
 def evaluate_response_async(
@@ -417,6 +547,8 @@ def evaluate_response_async(
     answer: str,
     contexts: List[str],
     ground_truth: Optional[str] = None,
+    on_complete=None,
+    on_error=None,
 ) -> Dict[str, Optional[float]]:
     """
     Async wrapper for RAGAS evaluation.
@@ -431,9 +563,19 @@ def evaluate_response_async(
         def run_eval():
             try:
                 logger.info("[RAGAS] Background thread started")
-                evaluate_response(question, answer, contexts, ground_truth)
+                scores = evaluate_response(question, answer, contexts, ground_truth)
+                if on_complete:
+                    try:
+                        on_complete(scores)
+                    except Exception as callback_err:
+                        logger.error("[RAGAS] Completion callback failed: %s", callback_err, exc_info=True)
             except Exception as e:
                 logger.error("[RAGAS] Async evaluation failed: %s", e, exc_info=True)
+                if on_error:
+                    try:
+                        on_error(e)
+                    except Exception as callback_err:
+                        logger.error("[RAGAS] Error callback failed: %s", callback_err, exc_info=True)
 
         thread = threading.Thread(target=run_eval, daemon=True)
         thread.start()

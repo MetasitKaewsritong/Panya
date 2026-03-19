@@ -1,4 +1,3 @@
-import base64
 import json
 import logging
 import os
@@ -8,22 +7,27 @@ from typing import List
 
 from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 from app.chat.config import USE_PAGE_IMAGES, VISION_STRICT_MODE
+from app.chat.intent_extractor import resolve_question_intent
 from app.chat.logging_utils import log_chat_request
 from app.chat.prompts import build_enhanced_prompt, build_no_context_prompt, build_vision_prompt
 from app.chat.scoring import get_doc_score
 from app.chat.selection import select_context_docs
-from app.ragas_eval import ENABLE_BACKGROUND_RAGAS, ENABLE_RAGAS, empty_ragas_scores, evaluate_response_async
+from app.ragas_eval import (
+    ENABLE_BACKGROUND_RAGAS,
+    ENABLE_RAGAS,
+    calculate_answer_match,
+    empty_ragas_scores,
+    evaluate_response_async,
+    resolve_ground_truth,
+)
 from app.chat.text_utils import (
+    build_openai_compatible_image_parts,
     call_llm_with_retry,
-    encode_images_for_gemini,
     extract_text_from_llm_response,
-    fix_markdown_tables,
     format_chat_history,
     is_not_found_response,
-    preprocess_query,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,13 +118,86 @@ def _filter_retrieved_docs_by_scope(question: str, docs: List) -> List:
 def _has_primary_ragas_scores(scores: dict) -> bool:
     if not isinstance(scores, dict):
         return False
-    return scores.get("faithfulness") is not None or scores.get("answer_relevancy") is not None
+    return any(
+        scores.get(key) is not None
+        for key in ("faithfulness", "answer_relevancy", "answer_match", "context_precision", "context_recall")
+    )
+
+
+def _build_intent_only_result(
+    reply: str,
+    *,
+    requested_mode: str = "text",
+    intent_query: str = "",
+    intent_source: str = "",
+    intent_details: dict | None = None,
+) -> dict:
+    return {
+        "reply": reply,
+        "processing_time": 0.0,
+        "retrieval_time": 0.0,
+        "rerank_time": 0.0,
+        "llm_time": 0.0,
+        "context_count": 0,
+        "max_score": None,
+        "sources": [],
+        "source_details": [],
+        "ragas": empty_ragas_scores(),
+        "ragas_status": "disabled",
+        "response_mode": "unresolved",
+        "requested_mode": requested_mode,
+        "mode_fallback_reason": "intent_unresolved",
+        "answer_support_status": "unsupported",
+        "intent_query": intent_query,
+        "intent_source": intent_source,
+        "intent_details": intent_details or {},
+        "ragas_request": None,
+    }
+
+
+def _format_intent_context(intent_details: dict | None) -> str:
+    details = intent_details or {}
+    lines = []
+
+    brand = details.get("matched_brand") or details.get("brand")
+    model = details.get("matched_model_subbrand") or details.get("model_input")
+    intent = details.get("intent")
+    topic = details.get("topic")
+    retrieval_query = details.get("normalized_query")
+
+    if brand:
+        lines.append(f"Brand: {brand}")
+    if model:
+        lines.append(f"Model/Subbrand: {model}")
+    if intent:
+        lines.append(f"Intent: {intent}")
+    if topic:
+        lines.append(f"Topic: {topic}")
+    if retrieval_query:
+        lines.append(f"Retrieval Query: {retrieval_query}")
+
+    if not lines:
+        return "No structured intent was extracted."
+    return "\n".join(lines)
+
+
+def _determine_answer_support_status(reply: str, selected_docs: List, *, intent_ok: bool = True) -> str:
+    if not intent_ok:
+        return "unsupported"
+    if not selected_docs:
+        return "unsupported"
+    if not (reply or "").strip():
+        return "unsupported"
+    if is_not_found_response(reply):
+        return "unsupported"
+    return "supported"
 
 
 def answer_question(
     question: str,
     db_pool,
     llm,
+    intent_llm,
     embedder,
     collection: str,
     retriever_class,
@@ -129,22 +206,55 @@ def answer_question(
     use_page_images_override: bool | None = None,
     ragas_ground_truth: str | None = None,
 ) -> dict:
-    processed_msg = preprocess_query((question or "").strip())
-    if not processed_msg:
+    raw_question = (question or "").strip()
+    if not raw_question:
         return {"reply": "Please enter a question."}
+    requested_mode = "vision" if bool(use_page_images_override) else "text"
 
     t0 = time.perf_counter()
     history_section = format_chat_history(chat_history or [], max_messages=5)
+    intent_resolution = resolve_question_intent(
+        raw_question,
+        db_pool=db_pool,
+        collection=collection,
+        intent_llm=intent_llm,
+        history_section=history_section,
+    )
+    processed_msg = intent_resolution.normalized_query
+    intent_source = intent_resolution.source
+    if intent_resolution.status != "ok":
+        return _build_intent_only_result(
+            intent_resolution.reply or "I don't understand the question, could you be more specific?",
+            requested_mode=requested_mode,
+            intent_query=processed_msg,
+            intent_source=intent_source,
+            intent_details=intent_resolution.to_metadata(),
+        )
+    logger.info("[INTENT] source=%s query='%s'", intent_source, processed_msg[:200])
+    logger.info(
+        "[INTENT_SCOPE] brand_filters=%s model_filters=%s intent=%s",
+        intent_resolution.brand_filters,
+        intent_resolution.model_subbrand_filters,
+        intent_resolution.intent,
+    )
 
     t_retrieval_start = time.perf_counter()
     base_retriever = retriever_class(
         connection_pool=db_pool,
         embedder=embedder,
         collection=collection,
+        brand_filters=intent_resolution.brand_filters,
+        model_subbrand_filters=intent_resolution.model_subbrand_filters,
     )
     reranker = reranker_class(base_retriever=base_retriever)
     retrieved_docs = reranker.invoke(processed_msg) or []
     retrieved_docs = _filter_retrieved_docs_by_scope(question, retrieved_docs)
+    try:
+        from app.context_prep import boost_docs_with_source_page_text
+
+        retrieved_docs = boost_docs_with_source_page_text(retrieved_docs, raw_question)
+    except Exception as source_rerank_err:
+        logger.warning("[SOURCE_RERANK] Falling back to retrieval order: %s", source_rerank_err)
     retrieval_time = time.perf_counter() - t_retrieval_start
 
     t_rerank_start = time.perf_counter()
@@ -156,11 +266,26 @@ def answer_question(
     context_texts = [d.page_content for d in selected_docs]
     context_sources = [d.metadata.get("source", f"Document {i + 1}") for i, d in enumerate(selected_docs)]
     max_score = selection_metadata.get("max_score") or (get_doc_score(retrieved_docs[0]) if retrieved_docs else None)
+    intent_context = _format_intent_context(intent_resolution.to_metadata())
+    answer_context_texts = context_texts
+    source_page_contexts = []
+    try:
+        from app.context_prep import extract_source_page_contexts
+
+        source_page_contexts = extract_source_page_contexts(selected_docs)
+        if source_page_contexts:
+            answer_context_texts = source_page_contexts
+            logger.info(
+                "[ANSWER_CONTEXT] Using exact source page text for non-stream answer (%d pages)",
+                len(source_page_contexts),
+            )
+    except Exception as source_ctx_err:
+        logger.warning("[ANSWER_CONTEXT] Falling back to retrieval notes: %s", source_ctx_err)
 
     t_llm_start = time.perf_counter()
     reply = None
     use_page_images = USE_PAGE_IMAGES if use_page_images_override is None else bool(use_page_images_override)
-    strict_vision = use_page_images and VISION_STRICT_MODE
+    strict_vision = bool(use_page_images_override) or (use_page_images and VISION_STRICT_MODE)
     requested_mode = "vision" if use_page_images else "text"
     use_image_mode = use_page_images and selected_docs
     mode_fallback_reason = "no_selected_docs" if use_page_images and not selected_docs else None
@@ -181,21 +306,15 @@ def answer_question(
             page_images_for_ragas = page_images
 
             if page_images and len(page_images) > 0:
-                encoded_images = encode_images_for_gemini(page_images)
                 prompt_text = build_vision_prompt().format(
                     history_section=history_section,
                     page_count=len(page_images),
-                    question=processed_msg,
+                    intent_context=intent_context,
+                    question=raw_question,
                 )
 
                 content_parts = [{"type": "text", "text": prompt_text}]
-                for img_b64 in encoded_images:
-                    content_parts.append(
-                        {
-                            "type": "image_url",
-                            "image_url": f"data:image/png;base64,{img_b64}",
-                        }
-                    )
+                content_parts.extend(build_openai_compatible_image_parts(page_images))
                 message = HumanMessage(content=content_parts)
 
                 response = call_llm_with_retry(lambda: llm.invoke([message]))
@@ -236,13 +355,17 @@ def answer_question(
                 mode_fallback_reason = "vision_prepare_error"
 
     if not use_image_mode:
-        if context_texts:
-            context_str = "\n\n---\n\n".join(f"[Source: {src}]\n{c}" for src, c in zip(context_sources, context_texts))
+        if answer_context_texts:
+            if answer_context_texts is context_texts:
+                context_str = "\n\n---\n\n".join(f"[Source: {src}]\n{c}" for src, c in zip(context_sources, context_texts))
+            else:
+                context_str = "\n\n---\n\n".join(answer_context_texts)
             chain = (
                 {
                     "history_section": (lambda _: history_section),
                     "context": (lambda _: context_str),
-                    "question": RunnablePassthrough(),
+                    "intent_context": (lambda _: intent_context),
+                    "question": (lambda _: raw_question),
                 }
                 | build_enhanced_prompt()
                 | llm
@@ -252,7 +375,8 @@ def answer_question(
             chain = (
                 {
                     "history_section": (lambda _: history_section),
-                    "question": RunnablePassthrough(),
+                    "intent_context": (lambda _: intent_context),
+                    "question": (lambda _: raw_question),
                 }
                 | build_no_context_prompt()
                 | llm
@@ -260,7 +384,7 @@ def answer_question(
             )
         if reply is None:
             try:
-                reply = call_llm_with_retry(lambda: chain.invoke(processed_msg))
+                reply = call_llm_with_retry(lambda: chain.invoke({}))
             except Exception as e:
                 logger.error("[TEXT_MODE] Non-stream invoke failed: %s", e)
                 reply = (
@@ -268,9 +392,13 @@ def answer_question(
                     "(often quota or rate-limit related). Please retry in a bit."
                 )
 
-    reply = fix_markdown_tables(reply)
     llm_time = time.perf_counter() - t_llm_start
     total_time = time.perf_counter() - t0
+    answer_support_status = _determine_answer_support_status(
+        reply,
+        selected_docs,
+        intent_ok=(intent_resolution.status == "ok"),
+    )
 
     log_chat_request(
         question=question,
@@ -285,16 +413,43 @@ def answer_question(
 
     ragas_scores = empty_ragas_scores()
     ragas_status = "disabled"
+    ragas_request = None
+    resolved_ragas_ground_truth = ragas_ground_truth or resolve_ground_truth(question)
+    prefilled_answer_match = calculate_answer_match(reply, resolved_ragas_ground_truth)
+    if prefilled_answer_match is not None:
+        ragas_scores["answer_match"] = prefilled_answer_match
+        ragas_status = "complete"
     if ENABLE_RAGAS:
         try:
             ragas_contexts = context_texts
+
+            if source_page_contexts:
+                ragas_contexts = source_page_contexts
+                logger.info(
+                    "[RAGAS] Using exact source page contexts for evaluation (%d pages)",
+                    len(source_page_contexts),
+                )
+            else:
+                try:
+                    from app.context_prep import extract_source_page_contexts
+
+                    source_page_contexts = extract_source_page_contexts(selected_docs)
+                    if source_page_contexts:
+                        ragas_contexts = source_page_contexts
+                        logger.info(
+                            "[RAGAS] Using exact source page contexts for evaluation (%d pages)",
+                            len(source_page_contexts),
+                        )
+                except Exception as source_ctx_err:
+                    logger.warning("[RAGAS] Source page context extraction failed; using fallback contexts: %s", source_ctx_err)
+
             use_vision_ocr_context = os.getenv("RAGAS_USE_VISION_OCR_CONTEXT", "true").lower() in (
                 "1",
                 "true",
                 "yes",
                 "on",
             )
-            if use_image_mode and page_images_for_ragas and use_vision_ocr_context:
+            if not source_page_contexts and use_image_mode and page_images_for_ragas and use_vision_ocr_context:
                 try:
                     from app.context_prep import extract_ocr_contexts
 
@@ -307,20 +462,28 @@ def answer_question(
                 except Exception as ocr_err:
                     logger.warning("[RAGAS] OCR context extraction failed; using retrieved text: %s", ocr_err)
 
-            logger.info("[RAGAS] Triggering evaluation for non-stream response")
-            ragas_scores = evaluate_response_async(
-                question=question,
-                answer=reply,
-                contexts=ragas_contexts,
-                ground_truth=ragas_ground_truth,
-            )
             if ENABLE_BACKGROUND_RAGAS:
+                logger.info("[RAGAS] Queued evaluation for non-stream response")
                 ragas_status = "pending"
-            elif _has_primary_ragas_scores(ragas_scores):
-                ragas_status = "complete"
+                ragas_request = {
+                    "question": question,
+                    "answer": reply,
+                    "contexts": ragas_contexts,
+                    "ground_truth": resolved_ragas_ground_truth,
+                }
             else:
-                logger.warning("[RAGAS] No primary scores returned in sync mode")
-                ragas_status = "error"
+                logger.info("[RAGAS] Triggering evaluation for non-stream response")
+                ragas_scores = evaluate_response_async(
+                    question=question,
+                    answer=reply,
+                    contexts=ragas_contexts,
+                    ground_truth=resolved_ragas_ground_truth,
+                )
+                if _has_primary_ragas_scores(ragas_scores):
+                    ragas_status = "complete"
+                else:
+                    logger.warning("[RAGAS] No primary scores returned in sync mode")
+                    ragas_status = "error"
         except Exception as e:
             logger.error("[RAGAS] Failed to start evaluation: %s", e)
             ragas_scores = empty_ragas_scores()
@@ -334,13 +497,16 @@ def answer_question(
         "retrieval_time": round(retrieval_time, 2),
         "rerank_time": round(rerank_time, 2),
         "llm_time": round(llm_time, 2),
-        "context_count": len(context_texts),
+        "context_count": len(answer_context_texts),
         "max_score": max_score,
         "sources": context_sources,
         "source_details": [
             {
                 "source": doc.metadata.get("source", "Unknown"),
+                "source_id": doc.metadata.get("source_id", doc.metadata.get("source", "Unknown")),
                 "page": doc.metadata.get("page", "N/A"),
+                "brand": doc.metadata.get("brand", ""),
+                "model_subbrand": doc.metadata.get("model_subbrand", ""),
                 "chunk_id": doc.metadata.get("chunk_id", "N/A"),
                 "score": get_doc_score(doc),
             }
@@ -351,6 +517,11 @@ def answer_question(
         "response_mode": response_mode,
         "requested_mode": requested_mode,
         "mode_fallback_reason": mode_fallback_reason,
+        "answer_support_status": answer_support_status,
+        "intent_query": processed_msg,
+        "intent_source": intent_source,
+        "intent_details": intent_resolution.to_metadata(),
+        "ragas_request": ragas_request,
     }
 
 
@@ -358,6 +529,7 @@ def stream_answer_question(
     question: str,
     db_pool,
     llm,
+    intent_llm,
     embedder,
     collection: str,
     retriever_class,
@@ -375,25 +547,72 @@ def stream_answer_question(
     - {"type": "done"}
     """
 
-    processed_msg = preprocess_query((question or "").strip())
-    if not processed_msg:
-        yield json.dumps({"type": "token", "text": "Please enter a question."})
+    raw_question = (question or "").strip()
+    history_section = format_chat_history(chat_history or [], max_messages=5)
+    intent_resolution = resolve_question_intent(
+        raw_question,
+        db_pool=db_pool,
+        collection=collection,
+        intent_llm=intent_llm,
+        history_section=history_section,
+    )
+    processed_msg = intent_resolution.normalized_query
+    intent_source = intent_resolution.source
+    if intent_resolution.status != "ok":
+        yield json.dumps({"type": "token", "text": intent_resolution.reply or "I don't understand the question, could you be more specific?"})
+        yield json.dumps(
+            {
+                "type": "stats",
+                "data": {
+                    "processing_time": 0.0,
+                    "retrieval_time": 0.0,
+                    "llm_time": 0.0,
+                    "context_count": 0,
+                    "max_score": 0.0,
+                    "sources": [],
+                    "source_details": [],
+                    "ragas": empty_ragas_scores(),
+                    "ragas_status": "disabled",
+                    "response_mode": "text",
+                    "requested_mode": "text",
+                    "mode_fallback_reason": None,
+                    "intent_query": processed_msg,
+                    "intent_source": intent_source,
+                    "intent_details": intent_resolution.to_metadata(),
+                    "full_reply": intent_resolution.reply or "I don't understand the question, could you be more specific?",
+                },
+            }
+        )
         yield json.dumps({"type": "done"})
         return
 
     t0 = time.perf_counter()
     yield json.dumps({"type": "status", "msg": "Thinking..."})
-    history_section = format_chat_history(chat_history or [], max_messages=5)
+    logger.info("[INTENT] source=%s query='%s'", intent_source, processed_msg[:200])
+    logger.info(
+        "[INTENT_SCOPE] brand_filters=%s model_filters=%s intent=%s",
+        intent_resolution.brand_filters,
+        intent_resolution.model_subbrand_filters,
+        intent_resolution.intent,
+    )
 
     t_retrieval_start = time.perf_counter()
     base_retriever = retriever_class(
         connection_pool=db_pool,
         embedder=embedder,
         collection=collection,
+        brand_filters=intent_resolution.brand_filters,
+        model_subbrand_filters=intent_resolution.model_subbrand_filters,
     )
     reranker = reranker_class(base_retriever=base_retriever)
     retrieved_docs = reranker.invoke(processed_msg) or []
     retrieved_docs = _filter_retrieved_docs_by_scope(question, retrieved_docs)
+    try:
+        from app.context_prep import boost_docs_with_source_page_text
+
+        retrieved_docs = boost_docs_with_source_page_text(retrieved_docs, raw_question)
+    except Exception as source_rerank_err:
+        logger.warning("[SOURCE_RERANK] Stream fallback to retrieval order: %s", source_rerank_err)
     retrieval_time = time.perf_counter() - t_retrieval_start
 
     t_rerank_start = time.perf_counter()
@@ -435,16 +654,43 @@ def stream_answer_question(
 
     context_texts = [d.page_content for d in selected_docs]
     context_sources = list(dict.fromkeys([d.metadata.get("source", "Unknown") for d in selected_docs]))
+    intent_context = _format_intent_context(intent_resolution.to_metadata())
+    answer_context_texts = context_texts
+    source_page_contexts = []
+    try:
+        from app.context_prep import extract_source_page_contexts
+
+        source_page_contexts = extract_source_page_contexts(selected_docs)
+        if source_page_contexts:
+            answer_context_texts = source_page_contexts
+            logger.info(
+                "[ANSWER_CONTEXT] Using exact source page text for stream answer (%d pages)",
+                len(source_page_contexts),
+            )
+    except Exception as source_ctx_err:
+        logger.warning("[ANSWER_CONTEXT] Stream fallback to retrieval notes: %s", source_ctx_err)
 
     page_references = []
     seen_pages = set()
     for d in selected_docs:
         source = d.metadata.get("source", "Unknown")
+        source_id = d.metadata.get("source_id", source)
         page = d.metadata.get("page", 0)
+        brand = d.metadata.get("brand", "")
+        model_subbrand = d.metadata.get("model_subbrand", "")
         score = d.metadata.get("score", 0.0)
-        page_key = (source, page)
+        page_key = (source_id, page, brand, model_subbrand)
         if page_key not in seen_pages and page > 0:
-            page_references.append({"source": source, "page": page, "score": score})
+            page_references.append(
+                {
+                    "source": source,
+                    "source_id": source_id,
+                    "page": page,
+                    "brand": brand,
+                    "model_subbrand": model_subbrand,
+                    "score": score,
+                }
+            )
             seen_pages.add(page_key)
     page_references.sort(key=lambda x: x["score"], reverse=True)
 
@@ -462,7 +708,7 @@ def stream_answer_question(
     t_llm_start = time.perf_counter()
     full_reply = ""
     use_page_images = USE_PAGE_IMAGES if use_page_images_override is None else bool(use_page_images_override)
-    strict_vision = use_page_images and VISION_STRICT_MODE
+    strict_vision = bool(use_page_images_override) or (use_page_images and VISION_STRICT_MODE)
     requested_mode = "vision" if use_page_images else "text"
     use_image_mode = use_page_images and selected_docs
     mode_fallback_reason = "no_selected_docs" if use_page_images and not selected_docs else None
@@ -504,20 +750,14 @@ def stream_answer_question(
                     )
 
                 prompt_text = build_vision_prompt().format(
-                    question=processed_msg,
+                    question=raw_question,
                     history_section=history_section,
                     page_count=len(page_images),
+                    intent_context=intent_context,
                 )
 
                 content_parts = [{"type": "text", "text": prompt_text}]
-                for img in page_images:
-                    base64_image = base64.b64encode(img["image_data"]).decode("utf-8")
-                    content_parts.append(
-                        {
-                            "type": "image_url",
-                            "image_url": f"data:image/png;base64,{base64_image}",
-                        }
-                    )
+                content_parts.extend(build_openai_compatible_image_parts(page_images))
                 message = HumanMessage(content=content_parts)
 
                 logger.debug(
@@ -529,7 +769,7 @@ def stream_answer_question(
                 try:
                     response = call_llm_with_retry(lambda: llm.invoke([message]))
                     full_reply = extract_text_from_llm_response(response)
-                    if is_not_found_response(full_reply) and context_texts:
+                    if is_not_found_response(full_reply) and answer_context_texts:
                         if strict_vision:
                             logger.warning("[VISION_MODE] strict mode keeps vision not-found response")
                             if full_reply:
@@ -592,20 +832,24 @@ def stream_answer_question(
                 mode_fallback_reason = "vision_prepare_error"
 
     if not use_image_mode:
-        logger.info("[TEXT_MODE] chunks=%d", len(context_texts))
+        logger.info("[TEXT_MODE] chunks=%d", len(answer_context_texts))
 
-        if context_texts:
-            total_chars = sum(len(text) for text in context_texts)
+        if answer_context_texts:
+            total_chars = sum(len(text) for text in answer_context_texts)
             logger.debug("[TEXT_MODE] context_chars=%d", total_chars)
 
-            full_context_str = "\n\n---\n\n".join(
-                f"[Source: {d.metadata.get('source', 'Doc')}]\n{d.page_content}" for d in selected_docs
-            )
+            if answer_context_texts is context_texts:
+                full_context_str = "\n\n---\n\n".join(
+                    f"[Source: {d.metadata.get('source', 'Doc')}]\n{d.page_content}" for d in selected_docs
+                )
+            else:
+                full_context_str = "\n\n---\n\n".join(answer_context_texts)
             chain = (
                 {
                     "history_section": (lambda _: history_section),
                     "context": (lambda _: full_context_str),
-                    "question": RunnablePassthrough(),
+                    "intent_context": (lambda _: intent_context),
+                    "question": (lambda _: raw_question),
                 }
                 | build_enhanced_prompt()
                 | llm
@@ -616,7 +860,8 @@ def stream_answer_question(
             chain = (
                 {
                     "history_section": (lambda _: history_section),
-                    "question": RunnablePassthrough(),
+                    "intent_context": (lambda _: intent_context),
+                    "question": (lambda _: raw_question),
                 }
                 | build_no_context_prompt()
                 | llm
@@ -624,7 +869,7 @@ def stream_answer_question(
             )
 
         try:
-            for chunk in chain.stream(processed_msg):
+            for chunk in chain.stream({}):
                 full_reply += chunk
                 yield json.dumps({"type": "token", "text": chunk})
             logger.info("[TEXT_MODE] success response_length=%d", len(full_reply))
@@ -635,6 +880,11 @@ def stream_answer_question(
     llm_time = time.perf_counter() - t_llm_start
     total_time = time.perf_counter() - t0
     mode_str = "vision" if use_image_mode else "text"
+    answer_support_status = _determine_answer_support_status(
+        full_reply,
+        selected_docs,
+        intent_ok=(intent_resolution.status == "ok"),
+    )
     logger.info(
         "[COMPLETE] mode=%s response_length=%d llm_time=%.2fs total_time=%.2fs",
         mode_str,
@@ -645,16 +895,43 @@ def stream_answer_question(
 
     ragas_scores = empty_ragas_scores()
     ragas_status = "disabled"
+    ragas_request = None
+    resolved_ragas_ground_truth = ragas_ground_truth or resolve_ground_truth(question)
+    prefilled_answer_match = calculate_answer_match(full_reply, resolved_ragas_ground_truth)
+    if prefilled_answer_match is not None:
+        ragas_scores["answer_match"] = prefilled_answer_match
+        ragas_status = "complete"
     if ENABLE_RAGAS:
         try:
             ragas_contexts = context_texts
+
+            if source_page_contexts:
+                ragas_contexts = source_page_contexts
+                logger.info(
+                    "[RAGAS] Using exact source page contexts for stream evaluation (%d pages)",
+                    len(source_page_contexts),
+                )
+            else:
+                try:
+                    from app.context_prep import extract_source_page_contexts
+
+                    source_page_contexts = extract_source_page_contexts(selected_docs)
+                    if source_page_contexts:
+                        ragas_contexts = source_page_contexts
+                        logger.info(
+                            "[RAGAS] Using exact source page contexts for stream evaluation (%d pages)",
+                            len(source_page_contexts),
+                        )
+                except Exception as source_ctx_err:
+                    logger.warning("[RAGAS] Stream source page context extraction failed; using fallback contexts: %s", source_ctx_err)
+
             use_vision_ocr_context = os.getenv("RAGAS_USE_VISION_OCR_CONTEXT", "true").lower() in (
                 "1",
                 "true",
                 "yes",
                 "on",
             )
-            if use_image_mode and page_images_for_ragas and use_vision_ocr_context:
+            if not source_page_contexts and use_image_mode and page_images_for_ragas and use_vision_ocr_context:
                 try:
                     from app.context_prep import extract_ocr_contexts
 
@@ -667,20 +944,28 @@ def stream_answer_question(
                 except Exception as ocr_err:
                     logger.warning("[RAGAS] OCR context extraction failed; using retrieved text: %s", ocr_err)
 
-            logger.info("[RAGAS] Triggering evaluation for stream response")
-            ragas_scores = evaluate_response_async(
-                question=question,
-                answer=full_reply,
-                contexts=ragas_contexts,
-                ground_truth=ragas_ground_truth,
-            )
             if ENABLE_BACKGROUND_RAGAS:
+                logger.info("[RAGAS] Queued evaluation for stream response")
                 ragas_status = "pending"
-            elif _has_primary_ragas_scores(ragas_scores):
-                ragas_status = "complete"
+                ragas_request = {
+                    "question": question,
+                    "answer": full_reply,
+                    "contexts": ragas_contexts,
+                    "ground_truth": resolved_ragas_ground_truth,
+                }
             else:
-                logger.warning("[RAGAS] No primary scores returned in sync mode")
-                ragas_status = "error"
+                logger.info("[RAGAS] Triggering evaluation for stream response")
+                ragas_scores = evaluate_response_async(
+                    question=question,
+                    answer=full_reply,
+                    contexts=ragas_contexts,
+                    ground_truth=resolved_ragas_ground_truth,
+                )
+                if _has_primary_ragas_scores(ragas_scores):
+                    ragas_status = "complete"
+                else:
+                    logger.warning("[RAGAS] No primary scores returned in sync mode")
+                    ragas_status = "error"
         except Exception as e:
             logger.error("[RAGAS] Failed to start evaluation: %s", e)
             ragas_scores = empty_ragas_scores()
@@ -689,17 +974,20 @@ def stream_answer_question(
     yield json.dumps(
         {
             "type": "stats",
-            "data": {
-                "processing_time": round(total_time, 2),
-                "retrieval_time": round(retrieval_time, 2),
-                "llm_time": round(llm_time, 2),
-                "context_count": len(selected_docs),
-                "max_score": max_score or 0.0,
-                "sources": context_sources,
+                "data": {
+                    "processing_time": round(total_time, 2),
+                    "retrieval_time": round(retrieval_time, 2),
+                    "llm_time": round(llm_time, 2),
+                    "context_count": len(answer_context_texts),
+                    "max_score": max_score or 0.0,
+                    "sources": context_sources,
                 "source_details": [
                     {
                         "source": doc.metadata.get("source", "Unknown"),
+                        "source_id": doc.metadata.get("source_id", doc.metadata.get("source", "Unknown")),
                         "page": doc.metadata.get("page", "N/A"),
+                        "brand": doc.metadata.get("brand", ""),
+                        "model_subbrand": doc.metadata.get("model_subbrand", ""),
                         "chunk_id": doc.metadata.get("chunk_id", "N/A"),
                         "score": get_doc_score(doc),
                     }
@@ -710,6 +998,11 @@ def stream_answer_question(
                 "response_mode": mode_str,
                 "requested_mode": requested_mode,
                 "mode_fallback_reason": mode_fallback_reason,
+                "answer_support_status": answer_support_status,
+                "intent_query": processed_msg,
+                "intent_source": intent_source,
+                "intent_details": intent_resolution.to_metadata(),
+                "ragas_request": ragas_request,
                 "full_reply": full_reply,
             },
         }

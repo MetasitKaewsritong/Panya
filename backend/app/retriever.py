@@ -118,6 +118,8 @@ class PostgresVectorRetriever(BaseRetriever):
     collection: str = Field(default="plcnext")
     limit: int = Field(default_factory=lambda: _env_int("RETRIEVE_LIMIT", 50))
     include_golden_qa: bool = Field(default_factory=lambda: _env_bool("RETRIEVE_INCLUDE_GOLDEN_QA", False))
+    brand_filters: List[str] = Field(default_factory=list)
+    model_subbrand_filters: List[str] = Field(default_factory=list)
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
         # SentenceTransformer embedder returns numpy.ndarray
@@ -127,29 +129,31 @@ class PostgresVectorRetriever(BaseRetriever):
         try:
             register_vector(conn)
             with conn.cursor() as cur:
-                if self.include_golden_qa:
-                    cur.execute(
-                        """
-                        SELECT content, metadata, embedding <-> %s AS distance
-                        FROM documents
-                        WHERE collection = %s
-                        ORDER BY embedding <-> %s
-                        LIMIT %s
-                        """,
-                        (query_vector, self.collection, query_vector, self.limit),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT content, metadata, embedding <-> %s AS distance
-                        FROM documents
-                        WHERE collection = %s
-                          AND COALESCE(metadata->>'chunk_type', '') <> 'golden_qa'
-                        ORDER BY embedding <-> %s
-                        LIMIT %s
-                        """,
-                        (query_vector, self.collection, query_vector, self.limit),
-                    )
+                where_clauses = [
+                    "collection = %s",
+                    "COALESCE(metadata->>'readable', 'true') <> 'false'",
+                ]
+                params: list[Any] = [self.collection]
+
+                if not self.include_golden_qa:
+                    where_clauses.append("COALESCE(metadata->>'chunk_type', '') <> 'golden_qa'")
+
+                if self.brand_filters:
+                    where_clauses.append("brand = ANY(%s)")
+                    params.append(self.brand_filters)
+
+                if self.model_subbrand_filters:
+                    where_clauses.append("model_subbrand = ANY(%s)")
+                    params.append(self.model_subbrand_filters)
+
+                sql = f"""
+                    SELECT content, metadata, embedding <-> %s AS distance
+                    FROM documents
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY embedding <-> %s
+                    LIMIT %s
+                """
+                cur.execute(sql, [query_vector, *params, query_vector, self.limit])
                 rows = cur.fetchall()
 
             docs: List[Document] = []

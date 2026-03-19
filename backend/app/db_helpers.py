@@ -4,6 +4,14 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 from app.db import get_db_pool
 
+
+def _rollback_quietly(conn) -> None:
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
 def _row_to_dict(cur, row):
     if row is None:
         return None
@@ -22,6 +30,9 @@ def create_user(email: str, password_hash: str, full_name: Optional[str] = None)
             row = cur.fetchone()
             conn.commit()
             return _row_to_dict(cur, row)
+    except Exception:
+        _rollback_quietly(conn)
+        raise
     finally:
         pool.putconn(conn)
 
@@ -58,6 +69,9 @@ def save_refresh_token(user_id: int, token: str, ip: Optional[str] = None, ua: O
                 (user_id, token_hash, ua, ip, expires_at)
             )
             conn.commit()
+    except Exception:
+        _rollback_quietly(conn)
+        raise
     finally:
         pool.putconn(conn)
 
@@ -81,5 +95,8 @@ def revoke_refresh_token_by_hash(token: str) -> None:
         with conn.cursor() as cur:
             cur.execute("UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = %s;", (token_hash,))
             conn.commit()
+    except Exception:
+        _rollback_quietly(conn)
+        raise
     finally:
         pool.putconn(conn)

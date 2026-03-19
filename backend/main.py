@@ -28,7 +28,14 @@ from app.routes_auth import router as auth_router
 from app.routes_chat import router as chat_router
 
 from app.embed_logic import get_embedder
-from app.utils import set_llm
+from app.llm_factory import (
+    create_intent_llm,
+    create_main_llm,
+    is_intent_llm_enabled,
+    resolve_intent_llm_settings,
+    resolve_main_llm_settings,
+)
+from app.utils import set_intent_llm, set_llm
 from app.errors import (
     ErrorCode, AppException,
     create_error_response
@@ -36,6 +43,14 @@ from app.errors import (
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+def _provider_allows_blank_api_key(provider: str) -> bool:
+    return (provider or "").strip().lower() == "ollama"
+
+
+def _has_usable_api_key(provider: str, api_key: str) -> bool:
+    return _provider_allows_blank_api_key(provider) or bool(api_key and len(api_key) >= 10)
 
 # ============================================================================
 # CONFIGURATION
@@ -52,16 +67,28 @@ class Config:
         """Validate required configuration"""
         if not Config.DATABASE_URL:
             raise RuntimeError("DATABASE_URL environment variable is required.")
-        # Don't fail on missing GEMINI_API_KEY - allow server to start
-        if not Config.GEMINI_API_KEY:
-            logging.warning("GEMINI_API_KEY not set - LLM features will be unavailable")
-    
-    # Gemini Configuration
-    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+        # Don't fail on missing LLM API key - allow server to start
+        if not _has_usable_api_key(Config.LLM_PROVIDER, Config.LLM_API_KEY):
+            logging.warning("LLM_API_KEY not set - LLM features will be unavailable")
+
+    # Main LLM Configuration
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama")
+    LLM_API_KEY: str = (
+        os.getenv("LLM_API_KEY", "")
+        or os.getenv("OLLAMA_API_KEY", "")
+        or os.getenv("DASHSCOPE_API_KEY", "")
+        or os.getenv("OPENAI_API_KEY", "")
+    )
+    LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434/v1"))
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "hf.co/Qwen/Qwen3-VL-4B-Thinking-GGUF:Q4_K_M")
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
     LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "30"))
     LLM_NUM_PREDICT: int = int(os.getenv("LLM_NUM_PREDICT", "1024"))  # Max output tokens
+    INTENT_LLM_ENABLED: bool = os.getenv("INTENT_LLM_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    INTENT_LLM_MODEL: str = os.getenv("INTENT_LLM_MODEL", "phi4-mini:latest")
+    INTENT_LLM_TEMPERATURE: float = float(os.getenv("INTENT_LLM_TEMPERATURE", "0.0"))
+    INTENT_LLM_TIMEOUT: int = int(os.getenv("INTENT_LLM_TIMEOUT", "15"))
+    INTENT_LLM_NUM_PREDICT: int = int(os.getenv("INTENT_LLM_NUM_PREDICT", "160"))
     
     # Embeddings
     EMBED_MODEL_NAME: str = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
@@ -101,9 +128,15 @@ logger.info("=" * 60)
 
 # Validate required configuration
 Config.validate()
+llm_settings = resolve_main_llm_settings()
+intent_llm_settings = resolve_intent_llm_settings()
 
 logger.info("  Database URL: configured")
-logger.info(f"  Gemini Model: {config.GEMINI_MODEL}")
+logger.info("  Main LLM: %s (%s)", llm_settings["model"], llm_settings["provider"])
+if config.INTENT_LLM_ENABLED:
+    logger.info("  Intent LLM: %s (%s)", intent_llm_settings["model"], intent_llm_settings["provider"])
+else:
+    logger.info("  Intent LLM: disabled")
 logger.info(f"  Embed Model: {config.EMBED_MODEL_NAME}")
 logger.info("=" * 60)
 
@@ -166,32 +199,55 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to initialize DB pool via init_db_pool(): %s", e, exc_info=True)
         app.state.db_pool = None
     
-    # Initialize LLM (Gemini)
+    # Initialize main LLM
     app.state.llm = None
     try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        
-        logger.info("Initializing Gemini model: %s", config.GEMINI_MODEL)
-        
+        logger.info("Initializing main LLM: %s", config.LLM_MODEL)
+
         # Validate API key format before attempting to initialize
-        if not config.GEMINI_API_KEY or len(config.GEMINI_API_KEY) < 20:
-            logger.error("Invalid GEMINI_API_KEY format. Check your .env file.")
+        if not _has_usable_api_key(llm_settings["provider"], llm_settings["api_key"]):
+            logger.error("Invalid LLM API key format. Check your .env file.")
             logger.warning("Server will start without LLM; chat functionality will be limited")
         else:
-            app.state.llm = ChatGoogleGenerativeAI(
-                model=config.GEMINI_MODEL,
-                google_api_key=config.GEMINI_API_KEY,
+            app.state.llm = create_main_llm(
                 temperature=config.LLM_TEMPERATURE,
                 timeout=config.LLM_TIMEOUT,
                 max_tokens=config.LLM_NUM_PREDICT,
             )
             set_llm(app.state.llm)  # Share LLM with utils module
-            logger.info("Gemini loaded: %s (max %d tokens)", config.GEMINI_MODEL, config.LLM_NUM_PREDICT)
+            logger.info("Main LLM loaded: %s (max %d tokens)", config.LLM_MODEL, config.LLM_NUM_PREDICT)
     except ImportError:
-        logger.error("langchain-google-genai not installed. Run: pip install langchain-google-genai")
+        logger.error("langchain-openai not installed. Run: pip install langchain-openai")
     except Exception as e:
-        logger.error("Failed to load Gemini: %s", e)
+        logger.error("Failed to load main LLM: %s", e)
         logger.warning("Server will start without LLM; chat functionality will be limited")
+
+    # Initialize intent extraction LLM (optional)
+    app.state.intent_llm = None
+    set_intent_llm(None)
+    try:
+        if not is_intent_llm_enabled():
+            logger.info("Intent extraction LLM disabled")
+        elif not _has_usable_api_key(intent_llm_settings["provider"], intent_llm_settings["api_key"]):
+            logger.warning("Intent extraction LLM skipped because no valid API key is configured")
+        else:
+            logger.info("Initializing intent LLM: %s", config.INTENT_LLM_MODEL)
+            app.state.intent_llm = create_intent_llm(
+                temperature=config.INTENT_LLM_TEMPERATURE,
+                timeout=config.INTENT_LLM_TIMEOUT,
+                max_tokens=config.INTENT_LLM_NUM_PREDICT,
+            )
+            set_intent_llm(app.state.intent_llm)
+            logger.info(
+                "Intent LLM loaded: %s (max %d tokens)",
+                config.INTENT_LLM_MODEL,
+                config.INTENT_LLM_NUM_PREDICT,
+            )
+    except ImportError:
+        logger.error("langchain-openai not installed. Run: pip install langchain-openai")
+    except Exception as e:
+        logger.error("Failed to load intent LLM: %s", e)
+        logger.warning("Continuing without intent extraction; retrieval will use the original question")
     
     # Initialize embedder (use singleton from embed_logic)
     app.state.embedder = None
@@ -378,6 +434,7 @@ def health_check(request: Request):
     services = {
         "database": False,
         "llm": False,
+        "intent_llm": False,
         "embedder": False,
         "whisper": False
     }
@@ -393,6 +450,7 @@ def health_check(request: Request):
     
     # Check LLM, embedder, and whisper
     services["llm"] = request.app.state.llm is not None
+    services["intent_llm"] = getattr(request.app.state, "intent_llm", None) is not None
     services["embedder"] = request.app.state.embedder is not None
     services["whisper"] = request.app.state.whisper_model is not None
     

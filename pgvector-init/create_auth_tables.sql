@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS public.refresh_tokens (
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id 
   ON public.refresh_tokens(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token_hash
+  ON public.refresh_tokens(token_hash);
+
 -- chat_sessions table
 CREATE TABLE IF NOT EXISTS public.chat_sessions (
   id SERIAL PRIMARY KEY,
@@ -45,8 +48,12 @@ CREATE TABLE IF NOT EXISTS public.chat_messages (
     REFERENCES public.chat_sessions(id) ON DELETE CASCADE,
   role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
   content TEXT NOT NULL,
+  metadata JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
+
+ALTER TABLE IF EXISTS public.chat_messages
+  ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id
   ON public.chat_messages(session_id);

@@ -41,9 +41,13 @@ def select_context_docs(retrieved_docs: List, max_candidates: int = None) -> tup
     seen_pages = set()
     for i, doc in enumerate(candidates):
         score = get_doc_score(doc) or max_score
-        source = (doc.metadata or {}).get("source", "Unknown")
-        page = (doc.metadata or {}).get("page", 0)
-        page_key = (source, page)
+        meta = doc.metadata or {}
+        source = meta.get("source", "Unknown")
+        source_id = meta.get("source_id", source)
+        page = meta.get("page", 0)
+        brand = meta.get("brand", "")
+        model_subbrand = meta.get("model_subbrand", "")
+        page_key = (source_id, page, brand, model_subbrand)
 
         should_keep = i < RAGConfig.MIN_KEEP or score >= cutoff
         if not should_keep:
