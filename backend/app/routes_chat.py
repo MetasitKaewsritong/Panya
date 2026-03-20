@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 
-from app.chatbot import answer_question, stream_answer_question
+from app.chat.pipeline import answer_question, stream_answer_question
 from app.routes_auth import get_current_user
 from app.chat_db import (
     create_chat_session,
@@ -160,6 +160,7 @@ def chat(
         role="assistant",
         content=result["reply"],
         metadata={
+            "collection": payload.collection,
             "processing_time": result.get("processing_time", 0.0),
             "retrieval_time": result.get("retrieval_time", 0.0),
             "llm_time": result.get("llm_time", 0.0),
@@ -191,10 +192,12 @@ def chat(
         "requested_mode": result.get("requested_mode", "text"),
         "mode_fallback_reason": result.get("mode_fallback_reason"),
         "answer_support_status": result.get("answer_support_status"),
+        "collection": payload.collection,
         "intent_query": result.get("intent_query"),
         "intent_source": result.get("intent_source"),
         "intent_details": result.get("intent_details", {}),
         "metadata": {
+            "collection": payload.collection,
             "retrieval_time": result.get("retrieval_time", 0.0),
             "llm_time": result.get("llm_time", 0.0),
             "context_count": result.get("context_count", 0),
@@ -405,6 +408,7 @@ def chat_stream(
                         role="assistant",
                         content=full_reply,
                         metadata={
+                            "collection": payload.collection,
                             "processing_time": stats.get("processing_time"),
                             "retrieval_time": stats.get("retrieval_time"),
                             "llm_time": stats.get("llm_time"),

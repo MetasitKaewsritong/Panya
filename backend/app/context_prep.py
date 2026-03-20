@@ -147,6 +147,50 @@ def _resolve_pdf_page(source: str, source_id: Optional[str], chunk_text: str, cu
     return best_page
 
 
+def _get_page_overlap_radius() -> int:
+    """Get the page overlap radius from env (default 1 = add page-1 and page+1)."""
+    try:
+        return max(0, int(os.getenv("PAGE_OVERLAP_RADIUS", "1")))
+    except Exception:
+        return 1
+
+
+def _expand_pages_with_overlap(
+    page_map: Dict[tuple, float],
+    overlap_radius: int,
+) -> Dict[tuple, float]:
+    """
+    Expand page_map with adjacent pages (n±radius) for better context coverage.
+
+    Adjacent pages inherit a discounted score from their parent page so they
+    rank below directly-matched pages but still appear in the final set.
+    """
+    if overlap_radius <= 0:
+        return page_map
+
+    expanded = dict(page_map)
+    discount = 0.70  # Adjacent pages get 70% of parent score
+
+    for (source_id, source, page, brand, model_subbrand), score in page_map.items():
+        for offset in range(-overlap_radius, overlap_radius + 1):
+            if offset == 0:
+                continue
+            neighbor_page = page + offset
+            if neighbor_page < 1:
+                continue
+            neighbor_key = (source_id, source, neighbor_page, brand, model_subbrand)
+            neighbor_score = score * (discount ** abs(offset))
+            # Only add if not already present with a higher score
+            if neighbor_key not in expanded or neighbor_score > expanded[neighbor_key]:
+                expanded[neighbor_key] = neighbor_score
+
+    added = len(expanded) - len(page_map)
+    if added > 0:
+        logger.info("\U0001f4ce Page overlap (radius=%d): added %d adjacent pages", overlap_radius, added)
+
+    return expanded
+
+
 def extract_unique_pages(selected_docs: List[Document]) -> List[Dict[str, Any]]:
     """
     Extract unique pages from selected chunks with deduplication.
@@ -192,6 +236,11 @@ def extract_unique_pages(selected_docs: List[Document]) -> List[Dict[str, Any]]:
         key = (source_id, source, page, brand, model_subbrand)
         if key not in page_map or score > page_map[key]:
             page_map[key] = score
+
+    # Expand with adjacent pages (n±1) for better context coverage
+    overlap_radius = _get_page_overlap_radius()
+    if overlap_radius > 0:
+        page_map = _expand_pages_with_overlap(page_map, overlap_radius)
     
     # Convert to list and sort by score (descending)
     unique_pages = [
@@ -207,7 +256,7 @@ def extract_unique_pages(selected_docs: List[Document]) -> List[Dict[str, Any]]:
     ]
     unique_pages.sort(key=lambda x: x['score'], reverse=True)
     
-    logger.info(f"📄 Extracted {len(unique_pages)} unique pages from {len(selected_docs)} chunks")
+    logger.info(f"📄 Extracted {len(unique_pages)} unique pages from {len(selected_docs)} chunks (overlap_radius={overlap_radius})")
     
     # Log page details for debugging
     if unique_pages:

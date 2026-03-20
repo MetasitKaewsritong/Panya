@@ -189,9 +189,9 @@ class EnhancedFlashrankRerankRetriever(BaseRetriever):
         "plcnext", "phoenix contact", "gds", "esm", "profinet", "axc f",
         "axc f 2152", "axc f 3152", "axc f 1152", "plcnext engineer",
         # Mitsubishi
-        "melsec", "fx3", "fx3u", "fx3g", "iq-r", "rcpu", "qcpu", "lcpu",
+        "melsec", "melsecnet", "melsecnet/h", "fx3", "fx3u", "fx3g", "iq-r", "rcpu", "qcpu", "lcpu",
         "cc-link", "cc link", "edgecross", "data collector", "gx works",
-        "iq edgecross", "mitsubishi"
+        "iq edgecross", "mitsubishi", "qj71", "qj72", "qj71lp21", "qj71br11", "network module"
     ]
     _PROTO_TERMS = [
         "protocol", "mode", "rs-485", "rs485", "profinet", "ethernet",

@@ -1,7 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import ReactMarkdown from "react-markdown";
-import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { oneDark } from "react-syntax-highlighter/dist/esm/styles/prism";
+
 import {
   Plus,
   Send,
@@ -29,412 +27,13 @@ import {
 import api from "../utils/api";
 import { useVoiceRecording } from "../hooks/useVoiceRecording";
 
-/* ================= HELPER FUNCTIONS ================= */
-const formatTimeAgo = (timestamp) => {
-  if (!timestamp) return '';
-  const now = new Date();
-  const time = new Date(timestamp);
-  const diffMs = now - time;
-  const diffSec = Math.floor(diffMs / 1000);
-  const diffMin = Math.floor(diffSec / 60);
-  const diffHour = Math.floor(diffMin / 60);
-  const diffDay = Math.floor(diffHour / 24);
-
-  if (diffSec < 60) return 'just now';
-  if (diffMin < 60) return `${diffMin}m ago`;
-  if (diffHour < 24) return `${diffHour}h ago`;
-  if (diffDay === 1) return 'yesterday';
-  if (diffDay < 7) return `${diffDay}d ago`;
-  return time.toLocaleDateString();
-};
-
-const formatTime = (timestamp) => {
-  if (!timestamp) return '';
-  const time = new Date(timestamp);
-  return time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-};
-
-/**
- * Clean up malformed inline tables by converting them to proper markdown format.
- * This handles cases where tables are on a single line.
- */
-const fixMarkdownTable = (text) => {
-  if (!text || !text.includes('|')) return text;
-
-  const lines = text.split('\n');
-  const fixedLines = [];
-  
-  for (const line of lines) {
-    // Check if this is an inline table (has separator pattern inline)
-    // Pattern: | text | text | | --- | --- | | text | text |
-    if (line.includes('| ---') && line.split('|').length > 8) {
-      // This looks like an inline table, try to split it properly
-      const parts = line.split('|').map(p => p.trim()).filter(p => p);
-      
-      // Find separator indices (cells that are just dashes)
-      const sepIndices = [];
-      parts.forEach((p, i) => {
-        if (/^-+$/.test(p)) sepIndices.push(i);
-      });
-      
-      if (sepIndices.length > 0) {
-        const numCols = sepIndices[0];
-        
-        if (numCols > 0) {
-          // Build proper table rows
-          const rows = [];
-          for (let i = 0; i < parts.length; i += numCols) {
-            const rowParts = parts.slice(i, i + numCols);
-            if (rowParts.length === numCols) {
-              rows.push('| ' + rowParts.join(' | ') + ' |');
-            }
-          }
-          
-          if (rows.length > 0) {
-            fixedLines.push(rows.join('\n'));
-            continue;
-          }
-        }
-      }
-    }
-    
-    fixedLines.push(line);
-  }
-  
-  return fixedLines.join('\n');
-};
-
-const stripQualityMetrics = (text) => {
-  if (!text) return text;
-
-  const lines = String(text).split('\n');
-  const result = [];
-  let skipSection = false;
-
-  const isHorizontalRule = (line) => {
-    const trimmed = line.trim();
-    return trimmed === '---' || trimmed === '***' || trimmed === '___';
-  };
-
-  const markers = [
-    'response quality metrics',
-    '📊 response quality metrics',
-    'overall quality',
-    'answer relevancy',
-    'answer match',
-    'faithfulness',
-    'context precision',
-    'context recall',
-    'referenced documents',
-    '📚 referenced documents'
-  ];
-
-  for (const line of lines) {
-    const lower = line.toLowerCase();
-
-    if (markers.some(marker => lower.includes(marker))) {
-      // Remove a divider just before the metrics block
-      if (result.length > 0 && isHorizontalRule(result[result.length - 1])) {
-        result.pop();
-      }
-      skipSection = true;
-      continue;
-    }
-
-    if (skipSection) {
-      const isMetricLine = markers.some(marker => lower.includes(marker))
-        || lower.includes('%')
-        || lower.includes('.pdf')
-        || lower.includes('pages')
-        || line.trim().startsWith('•')
-        || line.trim().startsWith('-')
-        || isHorizontalRule(line);
-
-      if (isMetricLine || line.trim() === '') {
-        continue;
-      }
-
-      skipSection = false;
-    }
-
-    result.push(line);
-  }
-
-  return result.join('\n');
-};
-
-const RAGAS_METRIC_KEYS = [
-  "faithfulness",
-  "answer_relevancy",
-  "answer_match",
-  "context_precision",
-  "context_recall",
-];
-const RAGAS_METRIC_LABELS = {
-  faithfulness: "Faithfulness",
-  answer_relevancy: "Answer Relevancy",
-  answer_match: "Answer Match",
-  context_precision: "Context Precision",
-  context_recall: "Context Recall",
-};
-
-const formatRagasMetric = (value) => {
-  if (value === null || value === undefined) return "N/A";
-  const num = Number(value);
-  if (Number.isNaN(num)) return "N/A";
-  return `${(num * 100).toFixed(1)}%`;
-};
-
-const formatSeconds = (value) => {
-  if (value === null || value === undefined) return "N/A";
-  const num = Number(value);
-  if (Number.isNaN(num)) return "N/A";
-  return `${num.toFixed(num >= 10 ? 1 : 2)}s`;
-};
-
-const toPositivePageNumber = (value) => {
-  const num = Number(value);
-  if (!Number.isFinite(num) || num <= 0) return null;
-  return Math.round(num);
-};
-
-const formatResponseMode = (mode) => {
-  const value = String(mode || "").toLowerCase();
-  if (value === "vision") return "Vision";
-  if (value === "text") return "Text";
-  return null;
-};
-
-const formatIntentLabel = (value) => {
-  if (!value) return null;
-  return String(value)
-    .split("_")
-    .filter(Boolean)
-    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-};
-
-const formatIntentSourceLabel = (value) => {
-  const normalized = String(value || "").toLowerCase();
-  if (!normalized) return null;
-  if (normalized === "intent_llm_structured") return "Parsed Scope";
-  if (normalized.startsWith("fallback")) return "Fallback Scope";
-  return formatIntentLabel(value) || value;
-};
-
-const formatModelLabel = (value) => {
-  if (!value) return null;
-  return String(value)
-    .replace(/\s+User'?s Manual\s*\(Hardware\)\s*$/i, "")
-    .replace(/\s+Manual\s*\(Hardware\)\s*$/i, "")
-    .trim();
-};
-
-const getIntentSummaryRows = (message) => {
-  const details = message?.intentDetails || {};
-  const rows = [];
-
-  const brand = details.matched_brand || details.brand;
-  const model = formatModelLabel(details.matched_model_subbrand || details.model_input);
-  const intent = formatIntentLabel(details.intent);
-  const topic = details.topic || "";
-  const query = message?.intentQuery || details.normalized_query || "";
-  const status = details.status || "";
-
-  if (brand) rows.push({ label: "Brand", value: brand });
-  if (model) rows.push({ label: "Model", value: model });
-  if (intent) rows.push({ label: "Intent", value: intent });
-  if (topic) rows.push({ label: "Topic", value: topic });
-  if (query) rows.push({ label: "Search Query", value: query });
-  if (status && status !== "ok") {
-    rows.push({ label: "Status", value: formatIntentLabel(status) || status });
-  }
-
-  return rows;
-};
-
-const getScopeChipRows = (message) => {
-  const rows = getIntentSummaryRows(message);
-  return rows.filter((row) => ["Brand", "Model", "Intent"].includes(row.label));
-};
-
-const getIntentDetailRows = (message) => {
-  const rows = getIntentSummaryRows(message);
-  return rows.filter((row) => !["Brand", "Model", "Intent"].includes(row.label));
-};
-
-const shouldShowVisionFallback = (message) => {
-  const requested = String(message?.requestedMode || "").toLowerCase();
-  const response = String(message?.responseMode || "").toLowerCase();
-  return requested === "vision" && response !== "vision" && Boolean(message?.modeFallbackReason);
-};
-
-const getSelectedSourceGroups = (message) => {
-  const details = Array.isArray(message?.sourceDetails) ? message.sourceDetails : [];
-  const groups = new Map();
-
-  for (const item of details) {
-    if (!item) continue;
-
-    const source = item.source || item.source_id || "Unknown document";
-    const sourceId = item.source_id || source;
-    const key = `${sourceId}::${item.brand || ""}::${item.model_subbrand || ""}`;
-    const page = toPositivePageNumber(item.page);
-    const score = Number(item.score);
-    const existing = groups.get(key) || {
-      key,
-      source,
-      sourceId,
-      pages: [],
-      pageSet: new Set(),
-      score: Number.isFinite(score) ? score : null,
-    };
-
-    if (page !== null && !existing.pageSet.has(page)) {
-      existing.pageSet.add(page);
-      existing.pages.push(page);
-    }
-
-    if (Number.isFinite(score) && (existing.score === null || score > existing.score)) {
-      existing.score = score;
-    }
-
-    groups.set(key, existing);
-  }
-
-  if (!groups.size) {
-    const sources = Array.isArray(message?.sources) ? message.sources : [];
-    return [...new Set(sources.filter(Boolean))].map((source) => ({
-      key: source,
-      source,
-      sourceId: source,
-      pages: [],
-      score: null,
-    }));
-  }
-
-  return [...groups.values()]
-    .map((group) => ({
-      key: group.key,
-      source: group.source,
-      sourceId: group.sourceId,
-      pages: [...group.pages].sort((a, b) => a - b),
-      score: group.score,
-    }))
-    .sort((a, b) => {
-      if (a.score !== null && b.score !== null && a.score !== b.score) {
-        return b.score - a.score;
-      }
-      if (a.score !== null) return -1;
-      if (b.score !== null) return 1;
-      return a.source.localeCompare(b.source);
-    });
-};
-
-const mapServerMessage = (message) => ({
-  text: message.content,
-  sender: message.role === "user" ? "user" : "bot",
-  timestamp: message.created_at,
-  processingTime: message.metadata?.processing_time,
-  retrievalTime: message.metadata?.retrieval_time,
-  llmTime: message.metadata?.llm_time,
-  contextCount: message.metadata?.context_count ?? null,
-  sources: message.metadata?.sources || [],
-  sourceDetails: Array.isArray(message.metadata?.source_details) ? message.metadata.source_details : [],
-  ragas: message.metadata?.ragas || null,
-  ragasStatus: message.metadata?.ragas_status || null,
-  responseMode: message.metadata?.response_mode || null,
-  requestedMode: message.metadata?.requested_mode || null,
-  modeFallbackReason: message.metadata?.mode_fallback_reason || null,
-  answerSupportStatus: message.metadata?.answer_support_status || null,
-  intentQuery: message.metadata?.intent_query || null,
-  intentSource: message.metadata?.intent_source || null,
-  intentDetails: message.metadata?.intent_details || null,
-});
-
-const formatModeFallbackReason = (reason) => {
-  const value = String(reason || "").toLowerCase();
-  if (value === "no_selected_docs") return "No relevant pages were selected.";
-  if (value === "no_page_images") return "Page images could not be loaded.";
-  if (value === "vision_not_found") return "The vision model could not answer from the pages.";
-  if (value === "vision_prepare_error") return "The page-image context could not be prepared.";
-  if (value === "vision_invoke_error") return "The vision model request failed.";
-  return value ? `Fallback reason: ${value}` : "";
-};
-
-const getModeSummary = (message) => {
-  if (String(message?.answerSupportStatus || "").toLowerCase() !== "supported") {
-    return null;
-  }
-
-  const requested = String(message?.requestedMode || "").toLowerCase();
-  const response = String(message?.responseMode || "").toLowerCase();
-
-  if (requested === "vision" && response === "vision") {
-    return {
-      label: "Used page images",
-      tone: "vision",
-    };
-  }
-
-  if (requested === "vision" && response !== "vision") {
-    return {
-      label: "Vision fallback",
-      tone: "fallback",
-    };
-  }
-
-  if (response === "text") {
-    return {
-      label: "Used text context",
-      tone: "text",
-    };
-  }
-
-  return null;
-};
-
-const getModeChipClassName = (tone) => {
-  if (tone === "vision") return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  if (tone === "fallback") return "border-amber-200 bg-amber-50 text-amber-700";
-  return "border-slate-200 bg-slate-50 text-slate-600";
-};
-
-const shouldShowDetails = (message) => {
-  return Boolean(
-    getIntentDetailRows(message).length ||
-    (message?.ragasStatus && message.ragasStatus !== "disabled") ||
-    message?.intentSource ||
-    shouldShowVisionFallback(message) ||
-    getSelectedSourceGroups(message).length ||
-    (message?.llmTime !== null && message?.llmTime !== undefined) ||
-    (message?.processingTime !== null && message?.processingTime !== undefined)
-  );
-};
-
-const getLegacyQualitySummary = (message) => {
-  if (!message?.ragasStatus || message.ragasStatus === "disabled") return null;
-  if (message.ragasStatus === "pending") return "Evaluating answer quality...";
-  if (message.ragasStatus === "error") return "Quality evaluation could not be completed.";
-  const faithfulness = formatRagasMetric(message.ragas?.faithfulness);
-  const relevancy = formatRagasMetric(message.ragas?.answer_relevancy);
-  return `Faithfulness ${faithfulness} • Answer relevancy ${relevancy}`;
-};
-
-void getLegacyQualitySummary;
-
-const getQualitySummary = (message) => {
-  if (!message?.ragasStatus || message.ragasStatus === "disabled") return null;
-  if (message.ragasStatus === "pending") return "Evaluating answer quality...";
-  if (message.ragasStatus === "error") return "Quality evaluation could not be completed.";
-
-  const faithfulness = formatRagasMetric(message.ragas?.faithfulness);
-  const relevancy = formatRagasMetric(message.ragas?.answer_relevancy);
-  const answerMatch = formatRagasMetric(message.ragas?.answer_match);
-  return `Faithfulness ${faithfulness} | Answer relevancy ${relevancy} | Answer match ${answerMatch}`;
-};
-
-
+import {
+  formatTime,
+  mapServerMessage
+} from "../utils/formatters";
+import Sidebar from "../components/chat/Sidebar";
+import ChatInput from "../components/chat/ChatInput";
+import MessageBubble from "../components/chat/MessageBubble";
 
 function Chat({ onLogout }) {
   /* ================= STATE ================= */
@@ -468,14 +67,22 @@ function Chat({ onLogout }) {
     const stored = localStorage.getItem("chat_use_vision_mode");
     return stored === "true";
   });
+  const useVisionModeRef = useRef(useVisionMode);
 
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
   const abortControllerRef = useRef(null);
 
   useEffect(() => {
+    useVisionModeRef.current = useVisionMode;
     localStorage.setItem("chat_use_vision_mode", String(useVisionMode));
   }, [useVisionMode]);
+
+  const setAnswerMode = useCallback((mode) => {
+    const nextIsVision = mode === "vision";
+    useVisionModeRef.current = nextIsVision;
+    setUseVisionMode(nextIsVision);
+  }, []);
 
   // Voice recording hook
   const {
@@ -535,10 +142,6 @@ function Chat({ onLogout }) {
           updated_at: s.updated_at || s.created_at,
         }));
         setChatHistory(sessions);
-        // If no active chat and sessions exist, select the first one.
-        if (sessions.length > 0) {
-          setActiveChatId(prev => prev ?? sessions[0].id);
-        }
       })
       .catch(console.error);
   }, []);
@@ -691,6 +294,7 @@ function Chat({ onLogout }) {
   const handleSendMessage = useCallback(async (e) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
+    const requestedVisionMode = useVisionModeRef.current;
 
     const userMessage = { text: input, sender: "user", timestamp: new Date().toISOString() };
     setInput("");
@@ -710,6 +314,7 @@ function Chat({ onLogout }) {
     }
 
     let createdSessionId = null;
+    let userCancelled = false;
 
     try {
       // Use fetch for streaming (axios doesn't support it well in browser)
@@ -720,6 +325,8 @@ function Chat({ onLogout }) {
       // Create AbortController for cancellation support
       const abortController = new AbortController();
       abortControllerRef.current = abortController;
+      const origAbort = abortController.abort.bind(abortController);
+      abortController.abort = (...args) => { userCancelled = true; origAbort(...args); };
 
       const response = await fetch(`${api.defaults.baseURL}/api/chat/stream`, {
         method: "POST",
@@ -730,7 +337,7 @@ function Chat({ onLogout }) {
         body: JSON.stringify({
           message: userMessage.text,
           session_id: currentSessionId,
-          use_page_images: useVisionMode,
+          use_page_images: requestedVisionMode,
         }),
         signal: abortController.signal
       });
@@ -749,9 +356,10 @@ function Chat({ onLogout }) {
         contextCount: null,
         sources: [],
         sourceDetails: [],
+        collection: "plcnext",
         answerSupportStatus: null,
-        responseMode: useVisionMode ? "vision" : "text",
-        requestedMode: useVisionMode ? "vision" : "text",
+        responseMode: requestedVisionMode ? "vision" : "text",
+        requestedMode: requestedVisionMode ? "vision" : "text",
         modeFallbackReason: null,
       };
 
@@ -846,6 +454,7 @@ function Chat({ onLogout }) {
                     contextCount: stats.context_count ?? null,
                     sources: Array.isArray(stats.sources) ? stats.sources : last.sources || [],
                     sourceDetails: Array.isArray(stats.source_details) ? stats.source_details : last.sourceDetails || [],
+                    collection: stats.collection || last.collection || "plcnext",
                     ragas: stats.ragas || null,
                     ragasStatus: stats.ragas_status || null,
                     responseMode: stats.response_mode || last.responseMode || null,
@@ -875,12 +484,15 @@ function Chat({ onLogout }) {
 
     } catch (error) {
       console.error("Chat error:", error);
-      setPendingMessage(null);
 
-      const isCancelled = error.name === 'AbortError';
+      const isCancelled = error.name === 'AbortError' && userCancelled;
+      const errorText = isCancelled
+        ? "This question was cancelled."
+        : "Sorry, I encountered an error. Please try again.";
       const targetId = createdSessionId || activeChatId;
 
       if (targetId) {
+        setPendingMessage(null);
         setChatHistory(prev => prev.map(c => {
           if (c.id !== targetId) return c;
 
@@ -891,14 +503,35 @@ function Chat({ onLogout }) {
             ...c,
             messages: [...cleaned, {
               sender: 'bot',
-              text: isCancelled
-                ? "This question was cancelled."
-                : "Sorry, I encountered an error. Please try again.",
+              text: errorText,
               timestamp: new Date().toISOString(),
               isCancelled: isCancelled,
             }]
           };
         }));
+      } else {
+        // New chat where session ID was never received — show an error
+        // via a temporary chat so the user sees feedback.
+        const tempId = `temp-error-${Date.now()}`;
+        const errorSession = {
+          id: tempId,
+          title: userMessage.text.substring(0, 50) || "New Chat",
+          messages: [
+            userMessage,
+            {
+              sender: 'bot',
+              text: errorText,
+              timestamp: new Date().toISOString(),
+              isCancelled: isCancelled,
+            }
+          ],
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        setChatHistory(prev => [errorSession, ...prev]);
+        setActiveChatId(tempId);
+        setIsNewChat(false);
+        setPendingMessage(null);
       }
     } finally {
       setIsLoading(false);
@@ -908,7 +541,7 @@ function Chat({ onLogout }) {
         inputRef.current?.focus();
       }, 100);
     }
-  }, [input, isLoading, activeChatId, isNewChat, useVisionMode]);
+  }, [input, isLoading, activeChatId, isNewChat]);
 
   /* ================= CHAT PINNING ================= */
 
@@ -974,167 +607,24 @@ function Chat({ onLogout }) {
       )}
 
       {/* ===== SIDEBAR ===== */}
-      <aside className={`
-        ${isMobile
-          ? `fixed top-0 left-0 h-full z-50 transform transition-transform duration-200 ease-in-out ${sidebarCollapsed ? '-translate-x-full' : 'translate-x-0'} w-72`
-          : `${sidebarCollapsed ? 'w-16' : 'w-72'} transition-[width] duration-200 ease-in-out`
-        } 
-        p-4 bg-white border-r flex flex-col overflow-hidden
-      `}>
-        {/* Header with Logo and Collapse Button */}
-        <div className={`flex-shrink-0 mb-6 flex ${!isMobile && sidebarCollapsed ? 'flex-col items-center gap-2' : 'items-center justify-between'}`}>
-          {/* Logo Area - Expanded (and always on mobile when open) */}
-          {(isMobile || !sidebarCollapsed) && (
-            <div className="flex items-center gap-3 px-2">
-              <div className="bg-gradient-to-br from-blue-600 to-blue-700 p-2 rounded-xl shadow-lg shadow-gray-200">
-                <Bot className="w-6 h-6 text-white" />
-              </div>
-              <div>
-                <h1 className="text-lg font-bold text-gray-800 tracking-tight">PLC Assistant</h1>
-                <p className="text-[11px] font-medium text-gray-400 uppercase tracking-wider">Industrial AI</p>
-              </div>
-            </div>
-          )}
-          {/* Collapsed Logo - Desktop only */}
-          {!isMobile && sidebarCollapsed && (
-            <div className="bg-gradient-to-br from-blue-600 to-blue-700 p-2 rounded-xl shadow-lg shadow-gray-200">
-              <Bot className="w-6 h-6 text-white" />
-            </div>
-          )}
-          {/* Collapse/Close Button */}
-          <button
-            onClick={(e) => { e.currentTarget.blur(); setSidebarCollapsed(!sidebarCollapsed); }}
-            className="p-2 hover:bg-gray-100 rounded-lg transition-all text-gray-500 hover:text-gray-700"
-            title={isMobile ? 'Close menu' : (sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar')}
-          >
-            {isMobile ? (
-              <X size={20} />
-            ) : (
-              sidebarCollapsed ? <PanelLeft size={20} /> : <PanelLeftClose size={20} />
-            )}
-          </button>
-        </div>
-
-        {/* New Chat Button */}
-        <button
-          onClick={(e) => { e.currentTarget.blur(); handleNewChat(); }}
-          disabled={isLoading}
-          className={`flex items-center justify-center gap-2 w-full p-3 mb-4 bg-gradient-to-r from-blue-500 to-blue-600 text-white rounded-xl transition-all text-sm font-semibold shadow-md ${isLoading ? 'opacity-50 cursor-default' : 'hover:from-blue-600 hover:to-blue-700 hover:shadow-lg cursor-pointer'} ${!isMobile && sidebarCollapsed ? 'px-0' : ''}`}
-          title="New Chat"
-        >
-          <Plus size={18} />
-          {(isMobile || !sidebarCollapsed) && 'New Chat'}
-        </button>
-
-        {/* Search Box */}
-        {(isMobile || !sidebarCollapsed) && (
-          <div className="relative mb-3">
-            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search chats..."
-              disabled={isLoading}
-              className={`w-full pl-9 pr-8 py-2 text-sm bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-100 focus:border-blue-300 ${isLoading ? 'opacity-50 cursor-default' : ''}`}
-            />
-            {searchQuery && (
-              <button
-                onClick={(e) => { e.currentTarget.blur(); setSearchQuery(""); }}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 hover:bg-gray-200 rounded text-gray-400 hover:text-gray-600"
-              >
-                <X size={14} />
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Recent Label */}
-        {(isMobile || !sidebarCollapsed) && (
-          <div className="px-2 mb-2 text-xs font-semibold text-gray-400 uppercase tracking-wider">
-            {searchQuery ? `Results (${sortedChatHistory.length})` : 'Recent'}
-          </div>
-        )}
-        {/* Chat List */}
-        {(isMobile || !sidebarCollapsed) && (
-          <div className="flex-1 overflow-y-auto space-y-1 pr-1 custom-scrollbar">
-            {sortedChatHistory.map(chat => (
-              <div
-                key={chat.id}
-                onClick={() => { if (!isLoading) { setActiveChatId(chat.id); setIsNewChat(false); } }}
-                className={`group relative w-full text-left px-3 py-2.5 rounded-lg flex items-center gap-3 transition-colors
-                ${isLoading ? 'opacity-50 cursor-default' : 'cursor-pointer'}
-                ${chat.id === activeChatId ? "bg-blue-50/80 text-blue-700" : "text-gray-600 hover:bg-gray-50"}
-                ${sidebarCollapsed ? 'justify-center px-0' : ''}`}
-                title={sidebarCollapsed ? (chat.title || "New Chat") : undefined}
-              >
-                <div className="relative flex-shrink-0">
-                  <MessageSquareText size={18} className={`${chat.id === activeChatId ? "text-blue-600" : "text-gray-400"}`} />
-                  {pinnedChats.includes(chat.id) && (
-                    <Pin size={10} className="absolute -top-1 -right-1 text-amber-500 fill-amber-500" />
-                  )}
-                </div>
-
-                {/* === TITLE & TIMESTAMP === */}
-                {!sidebarCollapsed && (
-                  <div className="flex-1 min-w-0">
-                    <span className="truncate text-sm font-medium block max-w-[120px]">
-                      {chat.title || "New Chat"}
-                    </span>
-                    {chat.updated_at && (
-                      <span className="text-[10px] text-gray-400">
-                        {formatTimeAgo(chat.updated_at)}
-                      </span>
-                    )}
-                  </div>
-                )}
-
-                {/* === ACTION BUTTONS on Hover === */}
-                {!sidebarCollapsed && (
-                  <div className={`absolute right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity ${isLoading ? 'pointer-events-none opacity-0' : ''}`}>
-                    <button
-                      onClick={(e) => { e.currentTarget.blur(); togglePin(e, chat.id); }}
-                      disabled={isLoading}
-                      className={`p-1.5 rounded ${pinnedChats.includes(chat.id) ? 'text-amber-500' : 'text-gray-400 hover:text-amber-500 hover:bg-amber-50'}`}
-                      title={pinnedChats.includes(chat.id) ? "Unpin" : "Pin"}
-                    >
-                      <Pin size={14} className={pinnedChats.includes(chat.id) ? 'fill-amber-500' : ''} />
-                    </button>
-                    <button
-                      onClick={(e) => { e.currentTarget.blur(); handleDeleteSession(e, chat.id); }}
-                      disabled={isLoading}
-                      className="p-1.5 hover:bg-red-100 rounded text-gray-400 hover:text-red-500"
-                      title="Delete"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* User Profile with Logout */}
-        <div className={`mt-4 pt-4 border-t flex items-center gap-3 ${!isMobile && sidebarCollapsed ? 'justify-center flex-col' : ''}`}>
-          <div className="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 text-xs font-bold flex-shrink-0">
-            {user.full_name ? user.full_name.charAt(0) : "U"}
-          </div>
-          {(isMobile || !sidebarCollapsed) && (
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium text-gray-700 truncate">{user.full_name || user.name}</p>
-            </div>
-          )}
-          <button
-            onClick={(e) => { e.currentTarget.blur(); onLogout(); }}
-            className={`flex items-center gap-1.5 text-gray-500 hover:text-red-600 hover:bg-red-50 px-2 py-1.5 rounded-lg transition-all text-sm font-medium ${!isMobile && sidebarCollapsed ? 'mt-2' : ''}`}
-            title="Logout"
-          >
-            <LogOut size={16} />
-            {(isMobile || !sidebarCollapsed) && <span>Logout</span>}
-          </button>
-        </div>
-      </aside>
+      <Sidebar 
+        isMobile={isMobile}
+        sidebarCollapsed={sidebarCollapsed}
+        setSidebarCollapsed={setSidebarCollapsed}
+        isLoading={isLoading}
+        handleNewChat={handleNewChat}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
+        sortedChatHistory={sortedChatHistory}
+        activeChatId={activeChatId}
+        setActiveChatId={setActiveChatId}
+        setIsNewChat={setIsNewChat}
+        pinnedChats={pinnedChats}
+        togglePin={togglePin}
+        handleDeleteSession={handleDeleteSession}
+        user={user}
+        onLogout={onLogout}
+      />
 
       {/* ===== MAIN ===== */}
       <div className="flex-1 flex flex-col h-screen relative">
@@ -1185,90 +675,22 @@ function Chat({ onLogout }) {
 
             {/* Input Form - Centered */}
             <div className="w-full max-w-3xl px-4">
-              <form
-                onSubmit={handleSendMessage}
-                className="space-y-2"
-              >
-                <div className="flex items-center justify-end gap-2 px-1">
-                  <span className="text-[11px] font-medium text-gray-500">Answer mode</span>
-                  <div className="inline-flex rounded-lg border border-gray-200 bg-white p-0.5">
-                    <button
-                      type="button"
-                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(false); }}
-                      disabled={isLoading}
-                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${!useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
-                    >
-                      Text
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(true); }}
-                      disabled={isLoading}
-                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
-                    >
-                      Vision
-                    </button>
-                  </div>
-                </div>
-                <div className="flex-1 flex items-center bg-gray-50 border border-gray-200 rounded-3xl px-2 py-2 focus-within:ring-2 focus-within:ring-blue-100 transition-all focus-within:border-blue-300 focus-within:bg-white shadow-sm">
-                  <input
-                    ref={inputRef}
-                    type="text"
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    placeholder={isLoading ? "Press Enter to cancel the question" : isRecording ? "Listening... (Press Enter to stop)" : isTranscribing ? "Transcribing... (Press Enter to cancel)" : "Ask about PLC, automation... (Press Enter to enable voice input)"}
-                    className="flex-1 bg-transparent focus:outline-none text-gray-800 placeholder-gray-400 px-3 py-1.5 min-w-0"
-                    readOnly={isLoading || isTranscribing}
-                    onKeyDown={handleInputKeyDown}
-                    autoFocus
-                    aria-label="Message input"
-                  />
-                  <button
-                    type="button"
-                    onClick={(e) => { e.currentTarget.blur(); (isTranscribing ? cancelTranscription : (isRecording ? stopRecording : startRecording))(); }}
-                    disabled={isLoading}
-                    className={`p-2.5 rounded-full transition-all flex-shrink-0 mr-1 group ${isLoading ? 'pointer-events-none opacity-50' : ''} ${isRecording
-                      ? 'bg-blue-500 text-white animate-pulse'
-                      : isTranscribing
-                        ? 'bg-orange-100 text-orange-500 hover:bg-orange-200 cursor-pointer'
-                        : 'hover:bg-gray-200 text-gray-500 hover:text-gray-700'
-                      }`}
-                    aria-label={isTranscribing ? "Cancel transcription" : (isRecording ? "Stop recording" : "Start voice input")}
-                    title={isTranscribing ? "Click to cancel" : (isRecording ? "Click to stop" : "Voice input")}
-                  >
-                    {isTranscribing ? (
-                      <div className="relative">
-                        <LoaderCircle size={20} className="animate-spin" />
-                        <X size={10} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" />
-                      </div>
-                    ) : isRecording ? (
-                      <Ear size={20} />
-                    ) : (
-                      <Mic size={20} />
-                    )}
-                  </button>
-                  {isLoading ? (
-                    <button
-                      type="button"
-                      onClick={(e) => { e.currentTarget.blur(); abortControllerRef.current?.abort(); }}
-                      className="bg-red-600 text-white p-2.5 rounded-full hover:bg-red-700 transition-all shadow-sm flex-shrink-0"
-                      aria-label="Cancel request"
-                      title="Cancel"
-                    >
-                      <StopCircle size={20} />
-                    </button>
-                  ) : (
-                    <button
-                      type="submit"
-                      disabled={!input.trim() || isRecording || isTranscribing}
-                      className="bg-blue-600 text-white p-2.5 rounded-full hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed transition-all shadow-sm flex-shrink-0"
-                      aria-label="Send message"
-                    >
-                      <Send size={20} className={input.trim() ? "translate-x-0.5" : ""} />
-                    </button>
-                  )}
-                </div>
-              </form>
+              <ChatInput
+                handleSendMessage={handleSendMessage}
+                setAnswerMode={setAnswerMode}
+                isLoading={isLoading}
+                useVisionMode={useVisionMode}
+                inputRef={inputRef}
+                input={input}
+                setInput={setInput}
+                isRecording={isRecording}
+                isTranscribing={isTranscribing}
+                handleInputKeyDown={handleInputKeyDown}
+                cancelTranscription={cancelTranscription}
+                stopRecording={stopRecording}
+                startRecording={startRecording}
+                abortControllerRef={abortControllerRef}
+              />
               <div className="text-center text-[10px] text-gray-400 mt-3 font-medium">
                 PLC Assistant can make mistakes. Check important info.
               </div>
@@ -1301,301 +723,15 @@ function Chat({ onLogout }) {
                 )}
 
                 {activeChat?.messages.map((m, i) => (
-                  <div
+                  <MessageBubble
                     key={i}
-                    className={`flex flex-col ${m.sender === "user" ? "items-end" : "items-start"}`}
-                  >
-                    <div
-                      className={`max-w-[85%] px-5 py-3.5 rounded-2xl shadow-sm text-[15px] leading-relaxed break-words overflow-hidden
-                        ${m.sender === "user"
-                          ? "bg-gradient-to-r from-blue-600 to-blue-500 text-white rounded-br-sm"
-                          : "bg-white text-gray-800 border border-gray-100 rounded-bl-sm prose prose-sm max-w-none"
-                        }`}
-                      style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}
-                    >
-                      {m.sender === "bot" ? (
-                        m.isCancelled ? (
-                          <span className="text-red-500 font-medium text-sm">{m.text}</span>
-                        ) : m.isStreaming && !m.text ? (
-                          <div className="flex items-center gap-3 text-gray-500 text-sm">
-                            <LoaderCircle size={18} className="animate-spin text-blue-500" />
-                            <span className="font-medium">
-                              {String(m.requestedMode || "").toLowerCase() === "vision"
-                                ? "Reading selected manual pages..."
-                                : "Thinking..."}
-                            </span>
-                          </div>
-                        ) :
-                          <ReactMarkdown
-                            components={{
-                              code({ inline, className, children, ...props }) {
-                                const match = /language-(\w+)/.exec(className || '');
-                                return !inline && match ? (
-                                  <SyntaxHighlighter
-                                    style={oneDark}
-                                    language={match[1]}
-                                    PreTag="div"
-                                    className="rounded-lg text-sm my-2"
-                                    {...props}
-                                  >
-                                    {String(children).replace(/\n$/, '')}
-                                  </SyntaxHighlighter>
-                                ) : (
-                                  <code className="bg-gray-100 px-1.5 py-0.5 rounded text-sm font-mono" {...props}>
-                                    {children}
-                                  </code>
-                                );
-                              },
-                              p({ children }) {
-                                return <p className="mb-2 last:mb-0">{children}</p>;
-                              },
-                              ul({ children }) {
-                                return <ul className="list-disc ml-4 mb-2">{children}</ul>;
-                              },
-                              ol({ children }) {
-                                return <ol className="list-decimal ml-4 mb-2">{children}</ol>;
-                              },
-                              li({ children }) {
-                                return <li className="mb-1">{children}</li>;
-                              },
-                              strong({ children }) {
-                                return <strong className="font-semibold">{children}</strong>;
-                              },
-                              a({ href, children }) {
-                                return <a href={href} className="text-blue-600 hover:underline" target="_blank" rel="noopener noreferrer">{children}</a>;
-                              },
-                              table({ children }) {
-                                return (
-                                  <div className="overflow-x-auto my-3">
-                                    <table className="min-w-full border-collapse border border-gray-300 text-sm">
-                                      {children}
-                                    </table>
-                                  </div>
-                                );
-                              },
-                              thead({ children }) {
-                                return <thead className="bg-gray-100">{children}</thead>;
-                              },
-                              tbody({ children }) {
-                                return <tbody>{children}</tbody>;
-                              },
-                              tr({ children }) {
-                                return <tr className="border-b border-gray-200">{children}</tr>;
-                              },
-                              th({ children }) {
-                                return (
-                                  <th className="border border-gray-300 px-3 py-2 text-left font-semibold bg-gray-50">
-                                    {children}
-                                  </th>
-                                );
-                              },
-                              td({ children }) {
-                                return (
-                                  <td className="border border-gray-300 px-3 py-2">
-                                    {children}
-                                  </td>
-                                );
-                              },
-                              hr() {
-                                return null;
-                              }
-                            }}
-                          >
-                            {fixMarkdownTable(stripQualityMetrics(typeof m.text === 'string' ? m.text : String(m.text || '')))}
-                          </ReactMarkdown>
-                      ) : (
-                        m.text
-                      )}
-                    </div>
-
-                    {m.sender === "bot" && (
-                      <div className="mt-1 flex max-w-[85%] flex-col gap-2">
-                        <div className="flex flex-wrap items-center gap-2">
-                          {getModeSummary(m) && (
-                            <span className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium ${getModeChipClassName(getModeSummary(m).tone)}`}>
-                              {getModeSummary(m).label}
-                            </span>
-                          )}
-                          {getScopeChipRows(m).map((row) => (
-                            <span
-                              key={`${row.label}-${row.value}`}
-                              className="inline-flex rounded-full border border-blue-100 bg-blue-50 px-2.5 py-1 text-[11px] font-medium text-blue-700"
-                            >
-                              <span className="mr-1 text-blue-500">{row.label}:</span>
-                              <span className="max-w-[36ch] truncate">{row.value}</span>
-                            </span>
-                          ))}
-                        </div>
-
-                        {shouldShowDetails(m) && (
-                          <details className="rounded-xl border border-gray-200 bg-white/80 px-3 py-2 text-[12px] text-gray-700">
-                            <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
-                              <span className="font-medium text-gray-700">Details</span>
-                              <span className="text-[11px] text-gray-400">
-                                {getQualitySummary(m) || "Scope, timing, and retrieval info"}
-                              </span>
-                            </summary>
-
-                            <div className="mt-3 flex flex-col gap-3 border-t border-gray-100 pt-3">
-                              {(getIntentDetailRows(m).length > 0 || m.intentSource) && (
-                                <div className="rounded-lg border border-blue-100 bg-blue-50/60 px-3 py-2">
-                                  <div className="mb-2 flex items-center justify-between gap-2">
-                                    <div className="text-[10px] font-semibold uppercase tracking-wide text-blue-700">
-                                      Scope
-                                    </div>
-                                    {formatIntentSourceLabel(m.intentSource) && (
-                                      <span className="rounded bg-blue-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-blue-700">
-                                        {formatIntentSourceLabel(m.intentSource)}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="grid grid-cols-1 gap-y-2">
-                                    {getIntentDetailRows(m).map((row) => (
-                                      <div key={`${row.label}-${row.value}`} className="flex flex-col gap-0.5">
-                                        <span className="text-[10px] font-semibold uppercase tracking-wide text-blue-700">{row.label}</span>
-                                        <span className="break-words text-[12px] text-blue-950">{row.value}</span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
-
-                              {((m.llmTime !== null && m.llmTime !== undefined) || (m.processingTime !== null && m.processingTime !== undefined) || m.contextCount !== null) && (
-                                <div className="rounded-lg border border-gray-200 bg-white px-3 py-2">
-                                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
-                                    Response
-                                  </div>
-                                  <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-                                    <div className="flex items-center justify-between gap-2 text-[11px] text-gray-700">
-                                      <span>Answer Time</span>
-                                      <span className="font-semibold text-gray-900">
-                                        {formatSeconds(m.llmTime ?? m.processingTime)}
-                                      </span>
-                                    </div>
-                                    <div className="flex items-center justify-between gap-2 text-[11px] text-gray-700">
-                                      <span>Selected Pages</span>
-                                      <span className="font-semibold text-gray-900">
-                                        {getSelectedSourceGroups(m).reduce((count, group) => count + group.pages.length, 0) || (m.contextCount ?? 0)}
-                                      </span>
-                                    </div>
-                                  </div>
-                                </div>
-                              )}
-
-                              {m.ragasStatus && m.ragasStatus !== "disabled" && (
-                                <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
-                                  <div className="mb-2 flex items-center justify-between gap-2">
-                                    <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">
-                                      Quality Checks
-                                      {m.ragasStatus === "pending" ? " (Pending)" : ""}
-                                    </div>
-                                    {formatResponseMode(m.responseMode) && (
-                                      <span className="rounded bg-gray-200 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-gray-700">
-                                        {formatResponseMode(m.responseMode)}
-                                        {shouldShowVisionFallback(m) ? " fallback" : ""}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-                                    {RAGAS_METRIC_KEYS.map((key) => (
-                                      <div
-                                        key={key}
-                                        className="flex items-center justify-between gap-2 text-[11px] text-gray-700"
-                                      >
-                                        <span>{RAGAS_METRIC_LABELS[key]}</span>
-                                        <span className="font-semibold text-gray-900">
-                                          {formatRagasMetric(m.ragas?.[key])}
-                                        </span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                  <div className="mt-2 text-[11px] text-gray-500">
-                                    Answer Match compares the reply against the expected answer when ground truth is available. Context Precision and Context Recall also require ground truth.
-                                  </div>
-                                  {shouldShowVisionFallback(m) && (
-                                    <div className="mt-2 rounded-md border border-amber-100 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-800">
-                                      {formatModeFallbackReason(m.modeFallbackReason) || "Vision was requested, but this reply used text context."}
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                              {getSelectedSourceGroups(m).length > 0 && (
-                                <div className="rounded-lg border border-gray-200 bg-white px-3 py-2">
-                                  <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
-                                    Selected Documents
-                                  </div>
-                                  <div className="flex flex-col gap-2">
-                                    {getSelectedSourceGroups(m).map((group) => (
-                                      <div
-                                        key={group.key}
-                                        className="rounded-md border border-gray-200 bg-gray-50 px-2.5 py-2"
-                                      >
-                                        <div className="flex items-start justify-between gap-2">
-                                          <div className="break-words text-[11px] font-medium text-gray-900">
-                                            {group.source}
-                                          </div>
-                                          {group.score !== null && (
-                                            <span className="shrink-0 text-[10px] font-medium text-gray-500">
-                                              Score {group.score.toFixed(3)}
-                                            </span>
-                                          )}
-                                        </div>
-                                        <div className="mt-1 flex flex-wrap gap-1.5">
-                                          {group.pages.length > 0 ? (
-                                            group.pages.map((page) => (
-                                              <span
-                                                key={`${group.key}-page-${page}`}
-                                                className="rounded-full border border-gray-200 bg-white px-2 py-0.5 text-[10px] font-medium text-gray-700"
-                                              >
-                                                Page {page}
-                                              </span>
-                                            ))
-                                          ) : (
-                                            <span className="text-[10px] text-gray-500">Page N/A</span>
-                                          )}
-                                        </div>
-                                      </div>
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
-                            </div>
-                          </details>
-                        )}
-                      </div>
-                    )}
-                    
-                    <div className={`flex items-center gap-2 mt-1 ${m.sender === "user" ? "flex-row-reverse" : ""}`}>
-                      {m.timestamp && (
-                        <span className="text-[10px] text-gray-400 px-1">
-                          {formatTime(m.timestamp)}
-                        </span>
-                      )}
-                      <button
-                        onClick={(e) => { e.currentTarget.blur(); copyToClipboard(stripQualityMetrics(m.text), i); }}
-                        className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-all"
-                        title={copiedMessageId === i ? "Copied!" : "Copy message"}
-                      >
-                        {copiedMessageId === i ? (
-                          <Check size={14} className="text-green-500" />
-                        ) : (
-                          <Copy size={14} />
-                        )}
-                      </button>
-                      <button
-                        onClick={(e) => {
-                          e.currentTarget.blur();
-                          setInput(stripQualityMetrics(m.text));
-                          inputRef.current?.focus();
-                        }}
-                        className="p-1 rounded hover:bg-blue-100 text-gray-400 hover:text-blue-600 transition-all"
-                        title="Copy to chatbar"
-                      >
-                        <CornerDownLeft size={14} />
-                      </button>
-                    </div>
-                  </div>
+                    m={m}
+                    index={i}
+                    copiedMessageId={copiedMessageId}
+                    copyToClipboard={copyToClipboard}
+                    setInput={setInput}
+                    inputRef={inputRef}
+                  />
                 ))}
 
                 {/* Show pending message for new chat before session is created */}
@@ -1623,90 +759,22 @@ function Chat({ onLogout }) {
 
             {/* INPUT AREA - Bottom pinned */}
             <div className="p-4 shrink-0">
-              <form
-                onSubmit={handleSendMessage}
-                className="max-w-3xl mx-auto space-y-2"
-              >
-                <div className="flex items-center justify-end gap-2 px-1">
-                  <span className="text-[11px] font-medium text-gray-500">Answer mode</span>
-                  <div className="inline-flex rounded-lg border border-gray-200 bg-white p-0.5">
-                    <button
-                      type="button"
-                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(false); }}
-                      disabled={isLoading}
-                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${!useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
-                    >
-                      Text
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => { e.currentTarget.blur(); setUseVisionMode(true); }}
-                      disabled={isLoading}
-                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md transition-all ${useVisionMode ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-100"} ${isLoading ? "opacity-60 cursor-default" : ""}`}
-                    >
-                      Vision
-                    </button>
-                  </div>
-                </div>
-                <div className={`flex-1 flex items-center bg-gray-50 border border-gray-200 rounded-3xl px-2 py-2 focus-within:ring-2 focus-within:ring-blue-100 transition-all focus-within:border-blue-300 focus-within:bg-white shadow-sm ${isLoading ? 'opacity-60' : ''}`}>
-                  <input
-                    ref={inputRef}
-                    type="text"
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    placeholder={isLoading ? "Press Enter to cancel the question" : isRecording ? "Listening... (Press Enter to stop)" : isTranscribing ? "Transcribing... (Press Enter to cancel)" : "Ask about PLC, automation... (Press Enter to enable voice input)"}
-                    className="flex-1 bg-transparent focus:outline-none text-gray-800 placeholder-gray-400 px-3 py-1.5"
-                    readOnly={isLoading || isTranscribing}
-                    onKeyDown={handleInputKeyDown}
-                    autoFocus
-                    aria-label="Message input"
-                  />
-                  <button
-                    type="button"
-                    onClick={(e) => { e.currentTarget.blur(); (isTranscribing ? cancelTranscription : (isRecording ? stopRecording : startRecording))(); }}
-                    disabled={isLoading}
-                    className={`p-2.5 rounded-full transition-all flex-shrink-0 mr-1 group ${isLoading ? 'pointer-events-none opacity-50' : ''} ${isRecording
-                      ? 'bg-blue-500 text-white animate-pulse'
-                      : isTranscribing
-                        ? 'bg-orange-100 text-orange-500 hover:bg-orange-200 cursor-pointer'
-                        : 'hover:bg-gray-200 text-gray-500 hover:text-gray-700'
-                      }`}
-                    aria-label={isTranscribing ? "Cancel transcription" : (isRecording ? "Stop recording" : "Start voice input")}
-                    title={isTranscribing ? "Click to cancel" : (isRecording ? "Click to stop" : "Voice input")}
-                  >
-                    {isTranscribing ? (
-                      <div className="relative">
-                        <LoaderCircle size={20} className="animate-spin" />
-                        <X size={10} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" />
-                      </div>
-                    ) : isRecording ? (
-                      <Ear size={20} />
-                    ) : (
-                      <Mic size={20} />
-                    )}
-                  </button>
-                  {isLoading ? (
-                    <button
-                      type="button"
-                      onClick={(e) => { e.currentTarget.blur(); abortControllerRef.current?.abort(); }}
-                      className="bg-red-600 text-white p-2.5 rounded-full hover:bg-red-700 transition-all shadow-sm flex-shrink-0"
-                      aria-label="Cancel request"
-                      title="Cancel"
-                    >
-                      <StopCircle size={20} />
-                    </button>
-                  ) : (
-                    <button
-                      type="submit"
-                      disabled={!input.trim() || isRecording || isTranscribing}
-                      className="bg-blue-600 text-white p-2.5 rounded-full hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed transition-all shadow-sm flex-shrink-0"
-                      aria-label="Send message"
-                    >
-                      <Send size={20} className={input.trim() ? "translate-x-0.5" : ""} />
-                    </button>
-                  )}
-                </div>
-              </form>
+              <ChatInput
+                handleSendMessage={handleSendMessage}
+                setAnswerMode={setAnswerMode}
+                isLoading={isLoading}
+                useVisionMode={useVisionMode}
+                inputRef={inputRef}
+                input={input}
+                setInput={setInput}
+                isRecording={isRecording}
+                isTranscribing={isTranscribing}
+                handleInputKeyDown={handleInputKeyDown}
+                cancelTranscription={cancelTranscription}
+                stopRecording={stopRecording}
+                startRecording={startRecording}
+                abortControllerRef={abortControllerRef}
+              />
               <div className="text-center text-[10px] text-gray-400 mt-3 font-medium">
                 PLC Assistant can make mistakes. Check important info.
               </div>

@@ -4,7 +4,7 @@ import os
 class RAGConfig:
     """Centralized RAG configuration - tune via environment variables."""
 
-    FINAL_K = int(os.getenv("RAG_FINAL_K", "3"))
+    FINAL_K = int(os.getenv("RAG_FINAL_K", "5"))
     MIN_KEEP = int(os.getenv("RAG_MIN_KEEP", "2"))
     ALPHA = float(os.getenv("RAG_ALPHA", "0.6"))
     HARD_MIN = float(os.getenv("RAG_HARD_MIN", "0.10"))

@@ -288,6 +288,9 @@ def _choose_candidates(query: str, candidates: list[str]) -> tuple[str, float, l
 
 def _infer_brand_from_question(raw_question: str, brands: list[str]) -> tuple[str, float]:
     question_compact = _normalize_compact(raw_question)
+    if "melsec" in question_compact and "Mitsubishi" in brands:
+        return "Mitsubishi", 1.0
+        
     for brand in brands:
         brand_compact = _normalize_compact(brand)
         if brand_compact and brand_compact in question_compact:
@@ -471,9 +474,16 @@ def _build_heuristic_intent_resolution(
             resolution.brand_score = max(resolution.brand_score, 0.74)
 
     if not resolution.brand_filters and not resolution.model_subbrand_filters:
-        resolution.status = "unresolved"
-        resolution.reply = "I don't understand the question, could you be more specific?"
-        return resolution
+        # Fallback: allow unfiltered retrieval instead of hard-failing.
+        # The vector search may still find relevant content even when
+        # brand/model cannot be resolved from the question text.
+        logger.info(
+            "[INTENT] No brand/model filters matched (heuristic); "
+            "falling back to unfiltered retrieval for query='%s'",
+            raw_question[:120],
+        )
+        resolution.normalized_query = preprocess_query(raw_question)
+        resolution.extraction_confidence = 0.30
 
     effective_brand = resolution.matched_brand or resolution.brand
     effective_model = resolution.model_input or resolution.matched_model_subbrand
@@ -654,9 +664,16 @@ def resolve_question_intent(
             resolution.suggestions = [best_brand]
             return resolution
         else:
-            resolution.status = "unresolved"
-            resolution.reply = "I don't understand the question, could you be more specific?"
-            return resolution
+            # Fallback: proceed with brand only (no model filter).
+            logger.info(
+                "[INTENT] Brand match too low (score=%.3f); "
+                "falling back to unfiltered retrieval",
+                brand_score,
+            )
+            resolution.brand = ""
+            resolution.matched_brand = ""
+            resolution.brand_score = 0.0
+            resolution.brand_filters = []
     elif len(brands) == 1:
         resolution.brand = brands[0]
         resolution.matched_brand = brands[0]
@@ -714,9 +731,13 @@ def resolve_question_intent(
             resolution.suggestions = [best_model]
             return resolution
         else:
-            resolution.status = "unresolved"
-            resolution.reply = "I don't understand the question, could you be more specific?"
-            return resolution
+            # Fallback: proceed without model filter.
+            logger.info(
+                "[INTENT] Model match too low (score=%.3f, input='%s'); "
+                "proceeding without model filter",
+                model_score,
+                model_input[:60],
+            )
 
     if not resolution.brand_filters and resolution.model_subbrand_filters:
         inferred_brands = sorted(

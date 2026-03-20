@@ -1,0 +1,852 @@
+{
+  "generated_at": "2026-03-20T02:10:43.898105+00:00",
+  "benchmark_user": "melsecnet_benchmark_20260320_015641@example.com",
+  "question_scope": [
+    "Q1A",
+    "Q1B",
+    "Q2A",
+    "Q2B",
+    "Q3A",
+    "Q3B"
+  ],
+  "run_count": 12,
+  "runs": [
+    {
+      "run_idx": 1,
+      "created_at": "2026-03-20T01:56:49.159569+00:00",
+      "qid": "Q1A",
+      "group": "Network Module Model",
+      "question": "What is the model number of the MELSECNET/H network module used in the exercise?",
+      "expected_answer": "QJ71LP21-25",
+      "mode_requested": "text",
+      "requested_mode_echo": "text",
+      "response_mode": "text",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **MELSECNET/H** network module used in the exercise is part of the **Q-series** PLC models **10NS2** to **10NS5**.",
+      "session_id": 26,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 216,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.7850966663604795
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 61,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.9770646191778637
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 69,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8798159196263268
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0362,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 2,
+      "created_at": "2026-03-20T01:57:12.674162+00:00",
+      "qid": "Q1A",
+      "group": "Network Module Model",
+      "question": "What is the model number of the MELSECNET/H network module used in the exercise?",
+      "expected_answer": "QJ71LP21-25",
+      "mode_requested": "vision",
+      "requested_mode_echo": "vision",
+      "response_mode": "vision",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The model number of the **MELSECNET/H** network module used in the exercise is **SCHOOL-Q.NET10H-E** (Model Code: 13JW52).",
+      "session_id": 27,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 216,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.7850966663604795
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 61,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.9770646191778637
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 69,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8798159196263268
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0223,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 3,
+      "created_at": "2026-03-20T01:58:47.531448+00:00",
+      "qid": "Q1B",
+      "group": "Network Module Model",
+      "question": "Identify the network module model shown in Chapter 3 component setup.",
+      "expected_answer": "QJ71LP21-25",
+      "mode_requested": "text",
+      "requested_mode_echo": "text",
+      "response_mode": "text",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "Here’s a breakdown of the network module models presented in Chapter 3’s component setup demonstration machine system:\n\n*   **Network No.1**\n    *   Model Name: **Q02H**\n    *   Station: 1\n    *   PLC: A\n*   **Network No.50**\n    *   Model Name: **Q02H**\n    *   Station: 2\n    *   PLC: B\n*   **Network No. 150**\n    *   Model Name: **Q02H**\n    *   Station: 1\n    *   PLC: C\n*   **Network No. 100**\n    *   Model Name: **Q02H**\n    *   Station: 2\n    *   PLC: D\n*   **Network No. 100**\n    *   Model Name: **Q02H**\n    *   Station: 1\n    *   PLC: E",
+      "session_id": 28,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 123,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.36986145497432776
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 165,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.34606991580870405
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 113,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.31996586288724627
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0225,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 4,
+      "created_at": "2026-03-20T01:59:52.982276+00:00",
+      "qid": "Q1B",
+      "group": "Network Module Model",
+      "question": "Identify the network module model shown in Chapter 3 component setup.",
+      "expected_answer": "QJ71LP21-25",
+      "mode_requested": "vision",
+      "requested_mode_echo": "vision",
+      "response_mode": "vision",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The network module model shown in Chapter 3 component setup is **Q71LP21/Q71LP21/Q71LP25/Q71B** (or Q71B/Q71BR11).  This is based on information in Appendix 2.1, which lists the differences between network modules like Q71LP21/Q71LP21/Q71LP25/Q71B/Q71B/Q71BR11.",
+      "session_id": 29,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 123,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.36986145497432776
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 165,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.34606991580870405
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 113,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.31996586288724627
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.3015,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 5,
+      "created_at": "2026-03-20T02:01:13.705894+00:00",
+      "qid": "Q2A",
+      "group": "Remote I/O Module Model",
+      "question": "What is the model number of the remote I/O module in MELSECNET/H?",
+      "expected_answer": "QJ72LP25-25",
+      "mode_requested": "text",
+      "requested_mode_echo": "text",
+      "response_mode": "text",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **MELSECNET/H** remote I/O modules come in several models:\n\n*   **QJ71LP21**, **QJ71LP21-25**, and **QJ71BR21**\n*   **QJ71QLP21**, **AJ71QLP21**, **A1SJ71QLP21**\n*   **QJ71BR11**, **AJ71QBR11**, **A1SJ71QBR11**\n\nIt’s important to note that the MELSECNET/10 and MELSECNET/H network modules cannot be mixed.",
+      "session_id": 30,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 125,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8392562378374862
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 123,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8228536948812979
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 165,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8132945377135378
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.3195,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 6,
+      "created_at": "2026-03-20T02:01:33.758285+00:00",
+      "qid": "Q2A",
+      "group": "Remote I/O Module Model",
+      "question": "What is the model number of the remote I/O module in MELSECNET/H?",
+      "expected_answer": "QJ72LP25-25",
+      "mode_requested": "vision",
+      "requested_mode_echo": "vision",
+      "response_mode": "vision",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **Model/Subbrand** of the remote I/O module in MELSECNET/H is **Q71PLP21/Q71PLP21/Q71PLP21/Q71PLP21/Q71PLP21/Q71PLP21**\n\nSupporting detail: The Q71PLP21/Q71PLP21 models are listed on page 2 and 3.",
+      "session_id": 31,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 125,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8392562378374862
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 123,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8228536948812979
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 165,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8132945377135378
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0473,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 7,
+      "created_at": "2026-03-20T02:03:20.057772+00:00",
+      "qid": "Q2B",
+      "group": "Remote I/O Module Model",
+      "question": "Identify the module used as a remote I/O station.",
+      "expected_answer": "QJ72LP25-25",
+      "mode_requested": "text",
+      "requested_mode_echo": "text",
+      "response_mode": "text",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **QCPU** is selected when a **PLC** is selected for the **MELSECNET/H** remote I/O network.\n\nRemote I/O stations utilize the following:\n\n*   **Capacity:**\n    *   Link relay (LB): 16384 points\n    *   Link register (LW): 16384 points\n    *   Input (LX): 8192 points\n    *   Output (LY): 8192 points\n*   **Maximum I/O Points:** 4096 points per remote I/O station.\n*   **Link Points:** Up to 1600 bytes between a remote master station and a remote I/O station.\n*   **Network Types:**\n    *   Optical Loop System: Maximum total extension of 30km (98430ft.) - resistant to noise.\n    *   Coaxial Bus System: Maximum total extension of 500m (1640.5ft.) – easily wired.\n*   **Configuration Flexibility:** Stations can be reserved, and connection order is not crucial. Loop-back is performed when a station goes down.",
+      "session_id": 32,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 91,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.9568527626991272
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 102,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.5722808766365052
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0059,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 8,
+      "created_at": "2026-03-20T02:04:10.745203+00:00",
+      "qid": "Q2B",
+      "group": "Remote I/O Module Model",
+      "question": "Identify the module used as a remote I/O station.",
+      "expected_answer": "QJ72LP25-25",
+      "mode_requested": "vision",
+      "requested_mode_echo": "vision",
+      "response_mode": "vision",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **Remote I/O station** is a module used as a remote I/O station.\n\nHere’s supporting detail:\n\n*   The Remote I/O station module is identified as **QJ72** and **QJ71**.\n*   It can be configured using the **GX Configurator** and automatic refresh settings.\n*   It supports reading and writing data via an intelligent function module.\n*   The module supports the following parameters:\n    *   Link register W\n    *   Link register D\n    *   Buffer memory",
+      "session_id": 33,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 91,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.7980869496597873
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 94,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.789000784600989
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 102,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.7688745670974072
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.1418,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 9,
+      "created_at": "2026-03-20T02:06:32.980410+00:00",
+      "qid": "Q3A",
+      "group": "Coaxial Network Module",
+      "question": "What model is used for the coaxial bus type network module?",
+      "expected_answer": "QJ71BR11",
+      "mode_requested": "text",
+      "requested_mode_echo": "text",
+      "response_mode": "text",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **MELSECNET/H** network system supports both the **MELSECNET/H mode** and the **MELSECNET/10 mode**.\n\nWhen using the **MELSECNET/10 mode**, the coaxial bus type network module utilizes the following specifications:\n\n*   **Transmission type:** Coaxial bus type\n*   **Maximum total extension:** 500 m (1640.5 ft.)\n*   **Distance between stations:** 500m (1640.5 ft.): 5C-2V [coaxial bus type]",
+      "session_id": 34,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 121,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.6544828407158927
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 91,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.6328512168640182
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 173,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.5655974665055022
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0117,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 10,
+      "created_at": "2026-03-20T02:07:06.377407+00:00",
+      "qid": "Q3A",
+      "group": "Coaxial Network Module",
+      "question": "What model is used for the coaxial bus type network module?",
+      "expected_answer": "QJ71BR11",
+      "mode_requested": "vision",
+      "requested_mode_echo": "vision",
+      "response_mode": "vision",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **Q-series** coaxial bus type network module uses the **Q71LP21** model.",
+      "session_id": 35,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 91,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.6789965959106173
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 121,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.647577619935785
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 173,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.5544958554812807
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.197,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 11,
+      "created_at": "2026-03-20T02:09:29.461098+00:00",
+      "qid": "Q3B",
+      "group": "Coaxial Network Module",
+      "question": "Identify the MELSECNET/H module for coaxial communication.",
+      "expected_answer": "QJ71BR11",
+      "mode_requested": "text",
+      "requested_mode_echo": "text",
+      "response_mode": "text",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **MELSECNET/H** network system supports both the **MELSECNET/H mode** and the **MELSECNET/10 mode**.\n\n*   **Transmission Type:** Coaxial bus type / optical (SI) loop type\n*   **I/O (LX, LY):** 8,192 points\n*   **Link Relay (LB):** 16,383 points\n*   **Maximum number of link points:** Link register (LW) 16,383 points and Link register (LY) 8,192 points\n*   **Overall distance:** 500 m (1640.5 ft.) for coaxial bus type / 30 km (98430 ft.) for optical loop type.",
+      "session_id": 36,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 121,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8251999907654632
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 90,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8013909670668493
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 125,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8010519188025377
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0103,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    },
+    {
+      "run_idx": 12,
+      "created_at": "2026-03-20T02:10:42.896863+00:00",
+      "qid": "Q3B",
+      "group": "Coaxial Network Module",
+      "question": "Identify the MELSECNET/H module for coaxial communication.",
+      "expected_answer": "QJ71BR11",
+      "mode_requested": "vision",
+      "requested_mode_echo": "vision",
+      "response_mode": "vision",
+      "mode_fallback_reason": null,
+      "answer_support_status": "supported",
+      "answer": "The **MELSECNET/H** module for coaxial communication is identified as a coaxial type/optical SI loop type. It has 16,384 points for the link relay (LB) and 8,192 points for the link register (LW). It supports a maximum of 1,320 bytes/frame. The communication speed is 25 Mbps (from switch setting) or 10 Mbps (total number of stations).  The link scan time is 0.001 ms (total number of stations). It supports a communication speed of 10 Mbps (total number of stations).",
+      "session_id": 37,
+      "error": null,
+      "sources": [
+        "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf"
+      ],
+      "source_details": [
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 121,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8253421506383486
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 125,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8040755988078525
+        },
+        {
+          "source": "Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "source_id": "/app/data/Knowledge/Mitsubishi Programmable Logic Controller Training Manual MELSECNET_H course(Q-series).pdf",
+          "page": 90,
+          "brand": "Mitsubishi",
+          "model_subbrand": "Q-series",
+          "chunk_id": "N/A",
+          "score": 0.8027933601712727
+        }
+      ],
+      "faithfulness": null,
+      "answer_relevancy": null,
+      "answer_match": 0.0089,
+      "context_precision": null,
+      "context_recall": null,
+      "ragas_status": "pending",
+      "exact_model_hit": false
+    }
+  ],
+  "mode_summary": [
+    {
+      "mode": "text",
+      "runs": 6,
+      "exact_hits": 0,
+      "hit_rate": 0.0,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.06768333333333333,
+      "fallback_count": 0,
+      "response_modes": [
+        "text"
+      ]
+    },
+    {
+      "mode": "vision",
+      "runs": 6,
+      "exact_hits": 0,
+      "hit_rate": 0.0,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.1198,
+      "fallback_count": 0,
+      "response_modes": [
+        "vision"
+      ]
+    }
+  ],
+  "question_summary": [
+    {
+      "qid": "Q1A",
+      "mode": "text",
+      "expected_answer": "QJ71LP21-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0362,
+      "response_modes": [
+        "text"
+      ]
+    },
+    {
+      "qid": "Q1A",
+      "mode": "vision",
+      "expected_answer": "QJ71LP21-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0223,
+      "response_modes": [
+        "vision"
+      ]
+    },
+    {
+      "qid": "Q1B",
+      "mode": "text",
+      "expected_answer": "QJ71LP21-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0225,
+      "response_modes": [
+        "text"
+      ]
+    },
+    {
+      "qid": "Q1B",
+      "mode": "vision",
+      "expected_answer": "QJ71LP21-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.3015,
+      "response_modes": [
+        "vision"
+      ]
+    },
+    {
+      "qid": "Q2A",
+      "mode": "text",
+      "expected_answer": "QJ72LP25-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.3195,
+      "response_modes": [
+        "text"
+      ]
+    },
+    {
+      "qid": "Q2A",
+      "mode": "vision",
+      "expected_answer": "QJ72LP25-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0473,
+      "response_modes": [
+        "vision"
+      ]
+    },
+    {
+      "qid": "Q2B",
+      "mode": "text",
+      "expected_answer": "QJ72LP25-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0059,
+      "response_modes": [
+        "text"
+      ]
+    },
+    {
+      "qid": "Q2B",
+      "mode": "vision",
+      "expected_answer": "QJ72LP25-25",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.1418,
+      "response_modes": [
+        "vision"
+      ]
+    },
+    {
+      "qid": "Q3A",
+      "mode": "text",
+      "expected_answer": "QJ71BR11",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0117,
+      "response_modes": [
+        "text"
+      ]
+    },
+    {
+      "qid": "Q3A",
+      "mode": "vision",
+      "expected_answer": "QJ71BR11",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.197,
+      "response_modes": [
+        "vision"
+      ]
+    },
+    {
+      "qid": "Q3B",
+      "mode": "text",
+      "expected_answer": "QJ71BR11",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0103,
+      "response_modes": [
+        "text"
+      ]
+    },
+    {
+      "qid": "Q3B",
+      "mode": "vision",
+      "expected_answer": "QJ71BR11",
+      "exact_hits": 0,
+      "runs": 1,
+      "faithfulness_avg": null,
+      "answer_relevancy_avg": null,
+      "answer_match_avg": 0.0089,
+      "response_modes": [
+        "vision"
+      ]
+    }
+  ]
+}

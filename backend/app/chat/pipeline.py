@@ -181,6 +181,24 @@ def _format_intent_context(intent_details: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _build_source_reference(doc, collection: str) -> dict:
+    metadata = doc.metadata or {}
+    return {
+        "source": metadata.get("source", "Unknown"),
+        "source_id": metadata.get("source_id", metadata.get("source", "Unknown")),
+        "page": metadata.get("page", "N/A"),
+        "brand": metadata.get("brand", ""),
+        "model_subbrand": metadata.get("model_subbrand", ""),
+        "chunk_id": metadata.get("chunk_id", "N/A"),
+        "score": get_doc_score(doc),
+        "collection": collection,
+    }
+
+
+def _build_source_details(selected_docs: List, collection: str) -> list[dict]:
+    return [_build_source_reference(doc, collection) for doc in selected_docs]
+
+
 def _determine_answer_support_status(reply: str, selected_docs: List, *, intent_ok: bool = True) -> str:
     if not intent_ok:
         return "unsupported"
@@ -500,24 +518,14 @@ def answer_question(
         "context_count": len(answer_context_texts),
         "max_score": max_score,
         "sources": context_sources,
-        "source_details": [
-            {
-                "source": doc.metadata.get("source", "Unknown"),
-                "source_id": doc.metadata.get("source_id", doc.metadata.get("source", "Unknown")),
-                "page": doc.metadata.get("page", "N/A"),
-                "brand": doc.metadata.get("brand", ""),
-                "model_subbrand": doc.metadata.get("model_subbrand", ""),
-                "chunk_id": doc.metadata.get("chunk_id", "N/A"),
-                "score": get_doc_score(doc),
-            }
-            for doc in selected_docs
-        ],
+        "source_details": _build_source_details(selected_docs, collection),
         "ragas": ragas_scores,
         "ragas_status": ragas_status,
         "response_mode": response_mode,
         "requested_mode": requested_mode,
         "mode_fallback_reason": mode_fallback_reason,
         "answer_support_status": answer_support_status,
+        "collection": collection,
         "intent_query": processed_msg,
         "intent_source": intent_source,
         "intent_details": intent_resolution.to_metadata(),
@@ -689,6 +697,7 @@ def stream_answer_question(
                     "brand": brand,
                     "model_subbrand": model_subbrand,
                     "score": score,
+                    "collection": collection,
                 }
             )
             seen_pages.add(page_key)
@@ -981,24 +990,14 @@ def stream_answer_question(
                     "context_count": len(answer_context_texts),
                     "max_score": max_score or 0.0,
                     "sources": context_sources,
-                "source_details": [
-                    {
-                        "source": doc.metadata.get("source", "Unknown"),
-                        "source_id": doc.metadata.get("source_id", doc.metadata.get("source", "Unknown")),
-                        "page": doc.metadata.get("page", "N/A"),
-                        "brand": doc.metadata.get("brand", ""),
-                        "model_subbrand": doc.metadata.get("model_subbrand", ""),
-                        "chunk_id": doc.metadata.get("chunk_id", "N/A"),
-                        "score": get_doc_score(doc),
-                    }
-                    for doc in selected_docs
-                ],
+                "source_details": _build_source_details(selected_docs, collection),
                 "ragas": ragas_scores,
                 "ragas_status": ragas_status,
                 "response_mode": mode_str,
                 "requested_mode": requested_mode,
                 "mode_fallback_reason": mode_fallback_reason,
                 "answer_support_status": answer_support_status,
+                "collection": collection,
                 "intent_query": processed_msg,
                 "intent_source": intent_source,
                 "intent_details": intent_resolution.to_metadata(),
